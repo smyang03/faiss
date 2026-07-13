@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+env/
+
+# Streamlit/local runtime
+.streamlit/secrets.toml
+*.log
+*.pid
+
+# Generated feature/search artifacts
+artifacts/
+*.faiss
+*.npy
+*.npz
+*.jsonl
+*.sqlite
+*.db
+
+# Local datasets, models, and media
+db/
+model/
+video/
+external/
+firedb_v1_data.yaml
+scripts/run_firedb_yolov7_feature_build.py
+scripts/check_firedb_feature_status.ps1
+*.pt
+*.pth
+*.onnx
+*.engine
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.bmp
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.tif
+*.tiff
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
