@@ -36,6 +36,25 @@ class CurationReportConfig:
     batch_size: int = 256
 
 
+@dataclass
+class SimilarityReductionConfig:
+    index_dir: str
+    output_dir: str
+    max_query_records: int = 50000
+    top_k: int = 30
+    rerank_k: int = 200
+    seed: int = 42
+    class_filter: str = ""
+    size_bucket: str = ""
+    tight_threshold: float = 0.985
+    protect_cross_class_threshold: float = 0.90
+    same_class_only: bool = True
+    same_size_only: bool = True
+    min_group_size: int = 2
+    representatives_per_group: int = 1
+    batch_size: int = 256
+
+
 class UnionFind:
     def __init__(self) -> None:
         self.parent: Dict[int, int] = {}
@@ -202,6 +221,26 @@ def _group_medoid(features: np.ndarray, member_indices: Sequence[int]) -> int:
     return int(members[int(np.argmax(scores))])
 
 
+def _rank_representatives(features: np.ndarray, member_indices: Sequence[int], count: int) -> List[int]:
+    members = [int(value) for value in member_indices]
+    if not members:
+        return []
+    count = max(1, min(int(count), len(members)))
+    first = _group_medoid(features, members)
+    representatives = [int(first)]
+    while len(representatives) < count:
+        remaining = [member for member in members if member not in representatives]
+        if not remaining:
+            break
+        rep_vectors = np.asarray(features[np.asarray(representatives, dtype=np.int64)], dtype=np.float32)
+        rem_vectors = np.asarray(features[np.asarray(remaining, dtype=np.int64)], dtype=np.float32)
+        similarities = rem_vectors @ rep_vectors.T
+        nearest_rep_similarity = similarities.max(axis=1)
+        next_rep = int(remaining[int(np.argmin(nearest_rep_similarity))])
+        representatives.append(next_rep)
+    return representatives
+
+
 def _group_boundary(features: np.ndarray, member_indices: Sequence[int], count: int) -> List[int]:
     members = [int(value) for value in member_indices]
     if count <= 0 or len(members) <= 1:
@@ -214,6 +253,321 @@ def _group_boundary(features: np.ndarray, member_indices: Sequence[int], count: 
     scores = matrix @ centroid
     order = np.argsort(scores)[: min(int(count), len(members))]
     return [int(members[int(pos)]) for pos in order]
+
+
+def _component_from_adjacency(start: int, adjacency: Dict[int, Dict[int, float]], remaining: set[int]) -> List[int]:
+    stack = [int(start)]
+    component = []
+    seen = {int(start)}
+    while stack:
+        node = stack.pop()
+        component.append(node)
+        for neighbor in adjacency.get(node, {}):
+            neighbor = int(neighbor)
+            if neighbor in remaining and neighbor not in seen:
+                seen.add(neighbor)
+                stack.append(neighbor)
+    return sorted(component)
+
+
+def build_similarity_reduction_plan(config: SimilarityReductionConfig, progress: ProgressCallback = None) -> Dict:
+    index_dir = Path(config.index_dir)
+    output_dir = Path(config.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    index_config, index, features, records, total = _load_index(index_dir)
+    query_indices, record_cache = _candidate_indices(
+        records,
+        total=total,
+        max_query_records=int(config.max_query_records),
+        seed=int(config.seed),
+        class_filter=str(config.class_filter or ""),
+        size_bucket=str(config.size_bucket or ""),
+        progress=progress,
+    )
+    if len(query_indices) == 0:
+        raise ValueError("No records matched the reduction filters.")
+
+    def get_record(idx: int) -> CropRecord:
+        idx = int(idx)
+        record = record_cache.get(idx)
+        if record is None:
+            record = records[idx]
+            record_cache[idx] = record
+        return record
+
+    adjacency: Dict[int, Dict[int, float]] = {}
+    tight_edges: Dict[Tuple[int, int], Dict] = {}
+    protected_ids = set()
+    touched_ids = set(int(value) for value in query_indices.tolist())
+
+    for query_idx, neighbors in _exact_neighbors(
+        index,
+        features,
+        query_indices=query_indices,
+        total=total,
+        top_k=int(config.top_k),
+        rerank_k=int(config.rerank_k),
+        batch_size=int(config.batch_size),
+        progress=progress,
+    ):
+        query_record = get_record(query_idx)
+        query_size = record_size_bucket(query_record)
+        for neighbor_idx, score in neighbors:
+            neighbor_record = get_record(neighbor_idx)
+            neighbor_size = record_size_bucket(neighbor_record)
+            same_class = int(query_record.class_id) == int(neighbor_record.class_id)
+            same_size = str(query_size) == str(neighbor_size)
+            touched_ids.add(int(neighbor_idx))
+
+            if (not same_class) and float(score) >= float(config.protect_cross_class_threshold):
+                protected_ids.update([int(query_idx), int(neighbor_idx)])
+
+            if float(score) < float(config.tight_threshold):
+                continue
+            if bool(config.same_class_only) and not same_class:
+                continue
+            if bool(config.same_size_only) and not same_size:
+                continue
+
+            left, right = sorted((int(query_idx), int(neighbor_idx)))
+            adjacency.setdefault(left, {})[right] = max(float(score), adjacency.get(left, {}).get(right, -1.0))
+            adjacency.setdefault(right, {})[left] = max(float(score), adjacency.get(right, {}).get(left, -1.0))
+            left_record = get_record(left)
+            right_record = get_record(right)
+            tight_edges[(left, right)] = {
+                "record_idx": left,
+                "neighbor_idx": right,
+                "similarity": float(score),
+                "class_id": int(left_record.class_id),
+                "class_name": str(left_record.class_name),
+                "neighbor_class_id": int(right_record.class_id),
+                "neighbor_class_name": str(right_record.class_name),
+                "size_bucket": record_size_bucket(left_record),
+                "neighbor_size_bucket": record_size_bucket(right_record),
+                "record_file": Path(left_record.image_path).name,
+                "neighbor_file": Path(right_record.image_path).name,
+            }
+
+    group_rows: List[Dict] = []
+    member_rows: List[Dict] = []
+    record_actions: Dict[int, Dict[str, object]] = {}
+    grouped_ids = set()
+    representative_ids = set()
+    drop_ids = set()
+    group_id = 0
+
+    remaining = set(int(value) for value in adjacency)
+    while remaining:
+        seed_node = min(remaining)
+        component = _component_from_adjacency(seed_node, adjacency, remaining)
+        component_remaining = set(component)
+        while component_remaining:
+            rep = max(
+                component_remaining,
+                key=lambda node: (
+                    sum(1 for neighbor in adjacency.get(node, {}) if neighbor in component_remaining),
+                    sum(adjacency.get(node, {}).get(neighbor, 0.0) for neighbor in adjacency.get(node, {}) if neighbor in component_remaining),
+                    -node,
+                ),
+            )
+            direct_members = sorted(
+                node
+                for node in component_remaining
+                if node == rep or float(adjacency.get(rep, {}).get(node, -1.0)) >= float(config.tight_threshold)
+            )
+            if len(direct_members) < int(config.min_group_size):
+                component_remaining.remove(rep)
+                remaining.discard(rep)
+                continue
+
+            group_id += 1
+            representatives = [int(rep)]
+            if int(config.representatives_per_group) > 1:
+                extra_reps = [
+                    int(value)
+                    for value in _rank_representatives(features, direct_members, int(config.representatives_per_group))
+                    if int(value) != int(rep)
+                ]
+                representatives.extend(extra_reps[: max(0, int(config.representatives_per_group) - 1)])
+            reps = set(int(value) for value in representatives)
+            member_scores = []
+            for member in direct_members:
+                if member == rep:
+                    similarity_to_primary = 1.0
+                else:
+                    similarity_to_primary = float(adjacency.get(rep, {}).get(member, np.nan))
+                member_scores.append(float(similarity_to_primary))
+                record = get_record(member)
+                protected = int(member) in protected_ids
+                if int(member) in reps:
+                    action = "KEEP_REPRESENTATIVE"
+                    reason = "tight group representative"
+                    representative_ids.add(int(member))
+                elif protected:
+                    action = "KEEP_PROTECTED_CROSS_CLASS"
+                    reason = "high similarity to another class"
+                else:
+                    action = "DROP_TIGHT_DUPLICATE"
+                    reason = "tight same-class feature duplicate"
+                    drop_ids.add(int(member))
+                grouped_ids.add(int(member))
+                record_actions[int(member)] = {"action": action, "reason": reason, "reduction_group_id": int(group_id)}
+                member_rows.append(
+                    {
+                        "reduction_group_id": int(group_id),
+                        "record_idx": int(member),
+                        "primary_representative_idx": int(rep),
+                        "representative_indices": " ".join(str(value) for value in representatives),
+                        "is_representative": bool(int(member) in reps),
+                        "is_protected": bool(protected),
+                        "similarity_to_primary": float(similarity_to_primary),
+                        "action": action,
+                        **record_to_row(record, int(member)),
+                    }
+                )
+
+            first_record = get_record(rep)
+            classes = sorted({f"{get_record(member).class_id}: {get_record(member).class_name}" for member in direct_members})
+            sizes = sorted({record_size_bucket(get_record(member)) for member in direct_members})
+            drop_count = sum(1 for row in member_rows if int(row["reduction_group_id"]) == group_id and str(row["action"]).startswith("DROP"))
+            group_rows.append(
+                {
+                    "reduction_group_id": int(group_id),
+                    "group_size": int(len(direct_members)),
+                    "drop_candidates": int(drop_count),
+                    "keep_count": int(len(direct_members) - drop_count),
+                    "natural_record_reduction_pct": float(drop_count / max(1, len(direct_members)) * 100.0),
+                    "primary_representative_idx": int(rep),
+                    "representative_indices": " ".join(str(value) for value in representatives),
+                    "class_id": int(first_record.class_id),
+                    "class_name": str(first_record.class_name),
+                    "classes": ", ".join(classes),
+                    "size_buckets": ", ".join(sizes),
+                    "min_similarity_to_primary": float(np.nanmin(member_scores)) if member_scores else 0.0,
+                    "mean_similarity_to_primary": float(np.nanmean(member_scores)) if member_scores else 0.0,
+                    "representative_file": Path(first_record.image_path).name,
+                    "representative_image_path": str(first_record.image_path),
+                }
+            )
+
+            for member in direct_members:
+                component_remaining.discard(int(member))
+                remaining.discard(int(member))
+
+    recommendation_rows = []
+    plan_indices = sorted(touched_ids | grouped_ids | representative_ids | drop_ids | protected_ids)
+    for record_idx in plan_indices:
+        record = get_record(record_idx)
+        action_info = record_actions.get(int(record_idx), {})
+        if not action_info and int(record_idx) in protected_ids:
+            action = "KEEP_PROTECTED_CROSS_CLASS"
+            reason = "high similarity to another class"
+        else:
+            action = str(action_info.get("action", "KEEP"))
+            reason = str(action_info.get("reason", "not in a tight duplicate group"))
+        group_value = action_info.get("reduction_group_id", "")
+        recommendation_rows.append(
+            {
+                **record_to_row(record, int(record_idx)),
+                "reduction_group_id": group_value,
+                "action": action,
+                "reason": reason,
+                "is_grouped": bool(int(record_idx) in grouped_ids),
+                "is_protected": bool(int(record_idx) in protected_ids),
+            }
+        )
+
+    recommendations_df = pd.DataFrame(recommendation_rows)
+    group_df = pd.DataFrame(group_rows).sort_values(
+        ["drop_candidates", "group_size", "mean_similarity_to_primary"],
+        ascending=[False, False, False],
+    ) if group_rows else pd.DataFrame()
+    member_df = pd.DataFrame(member_rows).sort_values(
+        ["reduction_group_id", "is_representative", "similarity_to_primary"],
+        ascending=[True, False, False],
+    ) if member_rows else pd.DataFrame()
+    edge_df = pd.DataFrame(list(tight_edges.values())).sort_values("similarity", ascending=False) if tight_edges else pd.DataFrame()
+
+    keep_records_df = recommendations_df[~recommendations_df["action"].astype(str).str.startswith("DROP")].copy()
+    drop_records_df = recommendations_df[recommendations_df["action"].astype(str).str.startswith("DROP")].copy()
+    partial_plan = int(config.max_query_records or 0) > 0 and int(config.max_query_records) < int(total)
+
+    image_rows = []
+    if not recommendations_df.empty:
+        for image_path, group in recommendations_df.groupby("image_path"):
+            actions = set(str(value) for value in group["action"].tolist())
+            keep_like = [action for action in actions if not action.startswith("DROP")]
+            image_action = "DROP_IMAGE_CANDIDATE" if not keep_like else "KEEP_IMAGE"
+            if any(str(action).startswith("KEEP_PROTECTED") for action in actions):
+                image_action = "KEEP_IMAGE"
+            drop_safety = "SAFE_ONLY_IN_FULL_PLAN"
+            if image_action == "DROP_IMAGE_CANDIDATE" and partial_plan:
+                drop_safety = "SAMPLE_ONLY_DO_NOT_DELETE"
+            elif image_action != "DROP_IMAGE_CANDIDATE":
+                drop_safety = "KEEP_OR_REVIEW"
+            image_rows.append(
+                {
+                    "image_path": str(image_path),
+                    "label_path": str(group["label_path"].iloc[0]),
+                    "file_name": Path(str(image_path)).name,
+                    "image_action": image_action,
+                    "drop_safety": drop_safety,
+                    "planned_records": int(len(group)),
+                    "drop_record_candidates": int(group["action"].astype(str).str.startswith("DROP").sum()),
+                    "actions": ", ".join(sorted(actions)),
+                    "classes": ", ".join(sorted(set(str(value) for value in group["class_name"].tolist()))),
+                }
+            )
+    image_df = pd.DataFrame(image_rows).sort_values(["image_action", "image_path"]) if image_rows else pd.DataFrame()
+
+    outputs = {
+        "reduction_groups.csv": group_df,
+        "reduction_group_members.csv": member_df,
+        "reduction_tight_edges.csv": edge_df,
+        "reduction_recommendations.csv": recommendations_df,
+        "reduction_keep_records.csv": keep_records_df,
+        "reduction_drop_records.csv": drop_records_df,
+        "reduction_image_plan.csv": image_df,
+    }
+    for filename, frame in outputs.items():
+        frame.to_csv(output_dir / filename, index=False, encoding="utf-8-sig")
+
+    drop_images_safe = 0
+    if not image_df.empty:
+        drop_mask = image_df["image_action"].astype(str).str.startswith("DROP")
+        drop_mask = drop_mask & (image_df["drop_safety"].astype(str) != "SAMPLE_ONLY_DO_NOT_DELETE")
+        drop_images_safe = int(drop_mask.sum())
+
+    summary = {
+        "index_dir": str(index_dir),
+        "output_dir": str(output_dir),
+        "total_records": int(total),
+        "sampled_query_records": int(len(query_indices)),
+        "planned_records": int(len(recommendations_df)),
+        "feature_dim": int(features.shape[1]),
+        "tight_threshold": float(config.tight_threshold),
+        "protect_cross_class_threshold": float(config.protect_cross_class_threshold),
+        "same_class_only": bool(config.same_class_only),
+        "same_size_only": bool(config.same_size_only),
+        "top_k": int(config.top_k),
+        "rerank_k": int(config.rerank_k),
+        "tight_edges": int(len(edge_df)),
+        "tight_groups": int(len(group_df)),
+        "grouped_records": int(len(grouped_ids)),
+        "representative_records": int(len(representative_ids)),
+        "protected_records": int(len(protected_ids)),
+        "drop_record_candidates": int(len(drop_records_df)),
+        "record_reduction_pct_of_planned": float(len(drop_records_df) / max(1, len(recommendations_df)) * 100.0),
+        "image_drop_candidates": int((image_df["image_action"].astype(str).str.startswith("DROP")).sum()) if not image_df.empty else 0,
+        "safe_image_drop_candidates": int(drop_images_safe),
+        "partial_plan": bool(partial_plan),
+        "index_config": index_config,
+        "reduction_config": asdict(config),
+    }
+    with (output_dir / "reduction_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    return {"summary": summary, "outputs": {key: str(output_dir / key) for key in outputs}, "output_dir": str(output_dir)}
 
 
 def build_curation_report(config: CurationReportConfig, progress: ProgressCallback = None) -> Dict:
@@ -604,5 +958,108 @@ def export_reduced_dataset(
         "copied_labels": int(copied_labels),
     }
     with (output / "reduced_dataset_summary.json").open("w", encoding="utf-8") as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    return summary
+
+
+def export_similarity_reduction_plan(
+    plan_dir: str,
+    output_dir: str,
+    images_root: str = "",
+    labels_root: str = "",
+    data_yaml: str = "",
+    mode: str = "manifest",
+) -> Dict:
+    plan_root = Path(plan_dir)
+    image_plan_path = plan_root / "reduction_image_plan.csv"
+    if not image_plan_path.exists():
+        raise FileNotFoundError(f"Missing reduction_image_plan.csv in {plan_root}")
+
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    image_plan = pd.read_csv(image_plan_path)
+    drop_mask = image_plan["image_action"].astype(str).str.startswith("DROP")
+    if "drop_safety" in image_plan.columns:
+        drop_mask = drop_mask & (image_plan["drop_safety"].astype(str) != "SAMPLE_ONLY_DO_NOT_DELETE")
+    keep_df = image_plan[~drop_mask].copy()
+    drop_df = image_plan[drop_mask].copy()
+
+    keep_images = [str(value) for value in keep_df["image_path"].dropna().tolist()]
+    keep_labels = [str(value) for value in keep_df["label_path"].dropna().tolist()]
+    (output / "keep_images.txt").write_text("\n".join(keep_images) + ("\n" if keep_images else ""), encoding="utf-8")
+    (output / "keep_labels.txt").write_text("\n".join(keep_labels) + ("\n" if keep_labels else ""), encoding="utf-8")
+    drop_df.to_csv(output / "drop_image_candidates.csv", index=False, encoding="utf-8-sig")
+
+    copied_images = 0
+    copied_labels = 0
+    mode = str(mode or "manifest").lower()
+    if mode in {"copy", "hardlink"}:
+        img_root = Path(images_root) if images_root else None
+        lbl_root = Path(labels_root) if labels_root else None
+        image_out_root = output / "images"
+        label_out_root = output / "labels"
+        for row in keep_df.itertuples(index=False):
+            image_path = Path(str(row.image_path))
+            label_path = Path(str(row.label_path))
+            if image_path.exists():
+                rel = _safe_relative(image_path, img_root, "external_images")
+                target = image_out_root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if mode == "hardlink":
+                    try:
+                        if not target.exists():
+                            target.hardlink_to(image_path)
+                    except Exception:
+                        shutil.copy2(image_path, target)
+                else:
+                    shutil.copy2(image_path, target)
+                copied_images += 1
+            if label_path.exists():
+                rel = _safe_relative(label_path, lbl_root, "external_labels")
+                target = label_out_root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if mode == "hardlink":
+                    try:
+                        if not target.exists():
+                            target.hardlink_to(label_path)
+                    except Exception:
+                        shutil.copy2(label_path, target)
+                else:
+                    shutil.copy2(label_path, target)
+                copied_labels += 1
+
+    if data_yaml:
+        source_yaml = Path(data_yaml)
+        if source_yaml.exists():
+            with source_yaml.open("r", encoding="utf-8") as f:
+                data = yaml.safe_load(f) or {}
+            reduced_yaml = {
+                "path": str(output.resolve()),
+                "train": "images",
+                "val": "images",
+                "names": data.get("names", {}),
+            }
+            with (output / "reduction_data.yaml").open("w", encoding="utf-8") as f:
+                yaml.safe_dump(reduced_yaml, f, allow_unicode=True, sort_keys=False)
+
+    summary_path = plan_root / "reduction_summary.json"
+    plan_summary = {}
+    if summary_path.exists():
+        with summary_path.open("r", encoding="utf-8") as f:
+            plan_summary = json.load(f) or {}
+
+    summary = {
+        "plan_dir": str(plan_root),
+        "output_dir": str(output),
+        "mode": mode,
+        "kept_images": int(len(keep_df)),
+        "drop_image_candidates": int(len(drop_df)),
+        "copied_images": int(copied_images),
+        "copied_labels": int(copied_labels),
+        "drop_record_candidates": int(plan_summary.get("drop_record_candidates", 0) or 0),
+        "record_reduction_pct_of_planned": float(plan_summary.get("record_reduction_pct_of_planned", 0.0) or 0.0),
+        "partial_plan": bool(plan_summary.get("partial_plan", False)),
+    }
+    with (output / "similarity_reduction_export_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
     return summary

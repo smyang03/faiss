@@ -44,8 +44,11 @@ from fp_finder.projects import (
 )
 from fp_finder.curation import (
     CurationReportConfig,
+    SimilarityReductionConfig,
     build_curation_report,
+    build_similarity_reduction_plan,
     export_reduced_dataset,
+    export_similarity_reduction_plan,
 )
 from fp_finder.feature_clustering import (
     SIZE_BUCKET_LABELS,
@@ -4420,6 +4423,10 @@ def reduced_dataset_root(project: Dict) -> Path:
     return Path("artifacts") / "reduced_datasets" / slugify(str(project.get("name", "project")))
 
 
+def reduction_plan_root(project: Dict) -> Path:
+    return Path("artifacts") / "reduction_plans" / slugify(str(project.get("name", "project")))
+
+
 def latest_report_dir(root: Path) -> Optional[Path]:
     if not root.exists():
         return None
@@ -4429,8 +4436,25 @@ def latest_report_dir(root: Path) -> Optional[Path]:
     return sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)[0]
 
 
+def latest_reduction_plan_dir(root: Path) -> Optional[Path]:
+    if not root.exists():
+        return None
+    candidates = [path for path in root.iterdir() if path.is_dir() and (path / "reduction_summary.json").exists()]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)[0]
+
+
 def load_report_summary(report_dir: str) -> Dict:
     path = Path(report_dir) / "summary.json"
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f) or {}
+
+
+def load_reduction_summary(plan_dir: str) -> Dict:
+    path = Path(plan_dir) / "reduction_summary.json"
     if not path.exists():
         return {}
     with path.open("r", encoding="utf-8") as f:
@@ -4462,6 +4486,221 @@ def render_report_csv_preview(report_dir: Path, filename: str, title: str, key_p
         )
     except Exception:
         pass
+
+
+def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) -> None:
+    st.divider()
+    st.subheader("Similarity Reduction Planner")
+    st.caption(
+        "No target reduction ratio is used. The planner groups only very tight same-class feature neighbors, "
+        "keeps representatives, protects cross-class-confusing samples, and then reports the natural reduction size."
+    )
+
+    plan_root = reduction_plan_root(project)
+    plan_root.mkdir(parents=True, exist_ok=True)
+    latest_plan = latest_reduction_plan_dir(plan_root)
+
+    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
+    with ctrl1:
+        plan_records = st.number_input(
+            "Planner records",
+            min_value=0,
+            max_value=10_000_000,
+            value=10000,
+            step=1000,
+            key="reduction_max_query_records",
+            help="0 uses all records and is required for safe image-level deletion/export decisions.",
+        )
+        reduction_top_k = st.number_input("Planner top-k", min_value=5, max_value=500, value=30, step=5, key="reduction_top_k")
+    with ctrl2:
+        reduction_rerank_k = st.number_input(
+            "Planner rerank-k",
+            min_value=10,
+            max_value=2000,
+            value=200,
+            step=10,
+            key="reduction_rerank_k",
+        )
+        reduction_batch_size = st.number_input(
+            "Planner batch",
+            min_value=16,
+            max_value=2048,
+            value=256,
+            step=16,
+            key="reduction_batch_size",
+        )
+    with ctrl3:
+        tight_threshold = st.slider(
+            "Tight sim",
+            min_value=0.90,
+            max_value=0.999,
+            value=0.985,
+            step=0.001,
+            format="%.3f",
+            key="reduction_tight_threshold",
+            help="Only neighbors above this similarity become reduction groups.",
+        )
+        protect_cross_threshold = st.slider(
+            "Protect cross-class sim",
+            min_value=0.50,
+            max_value=0.999,
+            value=0.90,
+            step=0.005,
+            format="%.3f",
+            key="reduction_protect_cross_threshold",
+            help="Samples close to another class above this value are kept for review instead of dropped.",
+        )
+    with ctrl4:
+        reduction_class_filter = st.text_input(
+            "Planner class filter",
+            value="",
+            placeholder="all / 0 / class name",
+            key="reduction_class_filter",
+        )
+        reduction_size_filter = st.selectbox(
+            "Planner size filter",
+            [""] + list(SIZE_BUCKET_ORDER),
+            format_func=lambda value: "All" if not value else SIZE_BUCKET_LABELS.get(value, value),
+            key="reduction_size_filter",
+        )
+
+    policy1, policy2, policy3, policy4 = st.columns(4)
+    with policy1:
+        same_class_only = st.checkbox("Same class only", value=True, key="reduction_same_class_only")
+    with policy2:
+        same_size_only = st.checkbox("Same size only", value=True, key="reduction_same_size_only")
+    with policy3:
+        min_group_size = st.number_input("Min group size", min_value=2, max_value=20, value=2, step=1, key="reduction_min_group_size")
+    with policy4:
+        representatives_per_group = st.number_input(
+            "Representatives/group",
+            min_value=1,
+            max_value=10,
+            value=1,
+            step=1,
+            key="reduction_representatives_per_group",
+        )
+
+    plan_name_default = datetime.now().strftime("%Y%m%d_%H%M%S")
+    plan_name = st.text_input("Reduction plan name", value=plan_name_default, key="reduction_plan_name")
+    plan_dir = plan_root / slugify(plan_name)
+
+    build_col1, build_col2 = st.columns([1, 3])
+    with build_col1:
+        run_plan = st.button("Build Reduction Plan", type="primary", key="btn_build_similarity_reduction_plan", use_container_width=True)
+    with build_col2:
+        st.caption(f"Output: {plan_dir}")
+
+    if run_plan:
+        status = st.empty()
+        progress_bar = st.progress(0.0)
+        start = time.time()
+
+        def progress(done: int, total: int, message: str) -> None:
+            pct = 0.0 if total <= 0 else min(1.0, done / max(1, total))
+            progress_bar.progress(pct)
+            status.caption(progress_with_eta(int(done), int(total), message, start))
+
+        try:
+            result = build_similarity_reduction_plan(
+                SimilarityReductionConfig(
+                    index_dir=feature_index_dir,
+                    output_dir=str(plan_dir),
+                    max_query_records=int(plan_records),
+                    top_k=int(reduction_top_k),
+                    rerank_k=int(reduction_rerank_k),
+                    seed=42,
+                    class_filter=str(reduction_class_filter),
+                    size_bucket=str(reduction_size_filter),
+                    tight_threshold=float(tight_threshold),
+                    protect_cross_class_threshold=float(protect_cross_threshold),
+                    same_class_only=bool(same_class_only),
+                    same_size_only=bool(same_size_only),
+                    min_group_size=int(min_group_size),
+                    representatives_per_group=int(representatives_per_group),
+                    batch_size=int(reduction_batch_size),
+                ),
+                progress=progress,
+            )
+            st.session_state["last_reduction_plan_dir"] = result["output_dir"]
+            progress_bar.progress(1.0)
+            status.success(f"Reduction plan complete in {format_duration(time.time() - start)}")
+        except Exception as exc:
+            status.error(f"Reduction plan failed: {exc}")
+
+    selected_plan_default = st.session_state.get("last_reduction_plan_dir") or (str(latest_plan) if latest_plan else str(plan_dir))
+    selected_plan = st.text_input("Reduction plan directory", value=str(selected_plan_default), key="reduction_selected_plan_dir")
+    selected_plan_path = Path(selected_plan)
+    if not (selected_plan_path / "reduction_summary.json").exists():
+        st.info("Build or select a reduction plan to preview natural reduction candidates.")
+        return
+
+    summary = load_reduction_summary(str(selected_plan_path))
+    metric1, metric2, metric3, metric4, metric5 = st.columns(5)
+    with metric1:
+        st.metric("Planned records", f"{int(summary.get('planned_records', 0)):,}")
+    with metric2:
+        st.metric("Tight groups", f"{int(summary.get('tight_groups', 0)):,}")
+    with metric3:
+        st.metric("Drop records", f"{int(summary.get('drop_record_candidates', 0)):,}")
+    with metric4:
+        st.metric("Natural reduction", f"{float(summary.get('record_reduction_pct_of_planned', 0.0)):.2f}%")
+    with metric5:
+        st.metric("Safe drop images", f"{int(summary.get('safe_image_drop_candidates', 0)):,}")
+
+    st.caption(
+        f"tight_sim={float(summary.get('tight_threshold', 0.0)):.3f} | "
+        f"same_class={summary.get('same_class_only')} | same_size={summary.get('same_size_only')} | "
+        f"protected_records={int(summary.get('protected_records', 0)):,}"
+    )
+    if summary.get("partial_plan"):
+        st.warning("This is a sampled reduction plan. Record-level candidates are useful for review, but image deletion/export exclusions are disabled for sample-only drops.")
+
+    red_tab1, red_tab2, red_tab3, red_tab4, red_tab5 = st.tabs(
+        ["Groups", "Members", "Drop/Keep", "Images", "Export"]
+    )
+    with red_tab1:
+        render_report_csv_preview(selected_plan_path, "reduction_groups.csv", "Tight Reduction Groups", "reduction_groups")
+        render_report_csv_preview(selected_plan_path, "reduction_tight_edges.csv", "Tight Similarity Edges", "reduction_edges")
+    with red_tab2:
+        render_report_csv_preview(selected_plan_path, "reduction_group_members.csv", "Group Members", "reduction_members")
+    with red_tab3:
+        render_report_csv_preview(selected_plan_path, "reduction_drop_records.csv", "Drop Record Candidates", "reduction_drop_records")
+        render_report_csv_preview(selected_plan_path, "reduction_keep_records.csv", "Keep Records", "reduction_keep_records")
+    with red_tab4:
+        render_report_csv_preview(selected_plan_path, "reduction_image_plan.csv", "Image-Level Plan", "reduction_images")
+    with red_tab5:
+        st.subheader("Export Similarity-Reduced Dataset")
+        st.caption("Manifest mode is safest. Copy/hardlink exports images whose image-level action is not a safe drop candidate.")
+        export_col1, export_col2, export_col3 = st.columns(3)
+        with export_col1:
+            export_name = st.text_input(
+                "Reduction export name",
+                value=datetime.now().strftime("%Y%m%d_%H%M%S"),
+                key="reduction_export_name",
+            )
+        with export_col2:
+            export_mode = st.selectbox("Reduction export mode", ["manifest", "copy", "hardlink"], index=0, key="reduction_export_mode")
+        with export_col3:
+            export_dir = reduced_dataset_root(project) / f"similarity_{slugify(export_name)}"
+            st.caption(f"Output: {export_dir}")
+        if st.button("Export Similarity Reduction", key="btn_export_similarity_reduction", use_container_width=True):
+            try:
+                result = export_similarity_reduction_plan(
+                    plan_dir=str(selected_plan_path),
+                    output_dir=str(export_dir),
+                    images_root=str(project.get("images_dir", "")),
+                    labels_root=str(project.get("labels_dir", "")),
+                    data_yaml=str(project.get("data_yaml", "")),
+                    mode=str(export_mode),
+                )
+                st.success(
+                    f"Export complete: kept_images={result['kept_images']:,}, "
+                    f"drop_images={result['drop_image_candidates']:,}, "
+                    f"drop_records={result['drop_record_candidates']:,}, output={result['output_dir']}"
+                )
+            except Exception as exc:
+                st.error(f"Reduction export failed: {exc}")
 
 
 def curation_report_tab(project: Dict, config: Dict) -> None:
@@ -4566,6 +4805,9 @@ def curation_report_tab(project: Dict, config: Dict) -> None:
             status.success(f"Curation report complete in {format_duration(time.time() - start)}")
         except Exception as exc:
             status.error(f"Curation report failed: {exc}")
+
+    similarity_reduction_planner_section(project, feature_index_dir)
+    st.divider()
 
     selected_report_default = st.session_state.get("last_curation_report_dir") or (str(latest_dir) if latest_dir else str(output_dir))
     selected_report = st.text_input("Report directory", value=str(selected_report_default), key="curation_selected_report_dir")

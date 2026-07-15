@@ -16,7 +16,14 @@ if str(ROOT) not in sys.path:
 import faiss
 import numpy as np
 
-from fp_finder.curation import CurationReportConfig, build_curation_report, export_reduced_dataset
+from fp_finder.curation import (
+    CurationReportConfig,
+    SimilarityReductionConfig,
+    build_curation_report,
+    build_similarity_reduction_plan,
+    export_reduced_dataset,
+    export_similarity_reduction_plan,
+)
 from fp_finder.feature_clustering import build_feature_clusters
 from fp_finder.video import collect_video_detections, read_video_frame
 from fp_finder.yolo_dataset import crop_from_record, index_records_ready, open_record_store
@@ -231,6 +238,42 @@ def main() -> int:
 
     checks.append(("curation_export", check_curation_export))
 
+    def check_similarity_reduction() -> dict:
+        plan_dir = output_dir / "similarity_reduction_plan"
+        export_dir = output_dir / "similarity_reduction_export"
+        result = build_similarity_reduction_plan(
+            SimilarityReductionConfig(
+                index_dir=str(index_dir),
+                output_dir=str(plan_dir),
+                max_query_records=int(args.curation_sample),
+                top_k=10,
+                rerank_k=30,
+                tight_threshold=0.98,
+                protect_cross_class_threshold=0.90,
+                batch_size=64,
+            )
+        )
+        export_summary = export_similarity_reduction_plan(str(plan_dir), str(export_dir), mode="manifest")
+        required = [
+            "reduction_summary.json",
+            "reduction_groups.csv",
+            "reduction_group_members.csv",
+            "reduction_image_plan.csv",
+            "reduction_recommendations.csv",
+        ]
+        missing = [name for name in required if not (plan_dir / name).exists()]
+        if missing:
+            raise FileNotFoundError(f"Missing reduction outputs: {missing}")
+        return {
+            "planned_records": int(result["summary"]["planned_records"]),
+            "tight_groups": int(result["summary"]["tight_groups"]),
+            "drop_record_candidates": int(result["summary"]["drop_record_candidates"]),
+            "record_reduction_pct": round(float(result["summary"]["record_reduction_pct_of_planned"]), 4),
+            "export": export_summary,
+        }
+
+    checks.append(("similarity_reduction", check_similarity_reduction))
+
     def check_calibration() -> dict:
         import app
 
@@ -329,4 +372,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

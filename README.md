@@ -194,6 +194,37 @@ python -u scripts/run_ui_regression.py `
   --output-dir artifacts/ui_regression/latest
 ```
 
+## Similarity-Based Dataset Reduction
+
+This mode does not use a target reduction ratio. It finds only very tight feature-neighbor groups, keeps group representatives, protects cross-class-confusing samples, and reports the natural reduction size.
+
+```powershell
+python -u scripts/build_similarity_reduction_plan.py `
+  --index-dir artifacts/yolo_feature_index_safety_env `
+  --output-dir artifacts/reduction_plans/safety_env/full_plan `
+  --max-query-records 0 `
+  --top-k 30 `
+  --rerank-k 200 `
+  --tight-threshold 0.985 `
+  --protect-cross-class-threshold 0.90
+```
+
+Use a small `--max-query-records` value for review. Use `0` only when you want a full plan that can safely drive image-level export decisions.
+
+Export the plan:
+
+```powershell
+python -u scripts/export_similarity_reduction_plan.py `
+  --plan-dir artifacts/reduction_plans/safety_env/full_plan `
+  --output-dir artifacts/reduced_datasets/safety_env/full_plan `
+  --images-root V:\dataset\images `
+  --labels-root V:\dataset\labels `
+  --data-yaml data.yaml `
+  --mode manifest
+```
+
+The UI exposes the same workflow under `Curation Report` -> `Similarity Reduction Planner`.
+
 ## Notes
 
 - Do not commit model weights, video files, datasets, or generated feature indexes.
