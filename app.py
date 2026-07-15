@@ -1871,21 +1871,20 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
                 "Class/size count metadata is not built yet. The page avoids scanning all records on load; "
                 "class filters still work by entering a class id, or build the metadata cache below."
             )
-            if st.button("Build Class/Size Metadata", key="btn_build_cluster_metadata", use_container_width=True):
-                records = open_record_store(feature_index_dir)
-                total = len(records)
-                progress_bar = st.progress(0.0)
-                status = st.empty()
-                start = time.time()
-
-                def progress(done: int, total_count: int, message: str) -> None:
-                    progress_bar.progress(0.0 if total_count <= 0 else min(1.0, done / max(1, total_count)))
-                    status.caption(progress_with_eta(int(done), int(total_count), message, start))
-
-                load_or_build_record_meta_arrays(feature_index_dir, records, total, progress=progress)
+            metadata_status_panel(project, compact=False)
+            col_meta1, col_meta2 = st.columns(2)
+            with col_meta1:
+                if st.button("Start Metadata Build", key="btn_start_cluster_metadata", use_container_width=True):
+                    pid = start_project_metadata_build(project)
+                    st.success(f"Metadata build started: PID {pid}")
+                    st.rerun()
+            with col_meta2:
+                if st.button("Refresh Metadata Status", key="btn_refresh_cluster_metadata", use_container_width=True):
+                    if metadata_progress_summary(project).get("stage") == "Ready":
+                        cached_cluster_metadata.clear()
+                    st.rerun()
+            if metadata_progress_summary(project).get("stage") == "Ready":
                 cached_cluster_metadata.clear()
-                progress_bar.progress(1.0)
-                status.success(f"Class/size metadata ready in {format_duration(time.time() - start)}")
                 st.rerun()
             return
         class_count_df = pd.DataFrame(
@@ -2805,6 +2804,287 @@ def project_preflight_errors(project: Dict, scan_nested: bool = True) -> List[st
     return [f"{row['item']}: {row['detail']}" for row in rows if row.get("status") == "FAIL"]
 
 
+def append_validation_row(rows: List[Dict], item: str, status: str, detail: str, kind: str = "validation") -> None:
+    rows.append({"item": item, "status": status, "kind": kind, "detail": detail})
+
+
+def same_existing_path(path_a: str, path_b: str) -> bool:
+    if not path_a or not path_b:
+        return False
+    try:
+        a = Path(path_a)
+        b = Path(path_b)
+        if a.exists() and b.exists():
+            return a.resolve() == b.resolve()
+    except Exception:
+        pass
+    return Path(path_a).name == Path(path_b).name
+
+
+def project_validation_rows(project: Dict) -> List[Dict]:
+    project = normalize_project(project)
+    rows: List[Dict] = []
+    rows.extend(project_preflight_rows(project, scan_nested=False))
+
+    feature_root = Path(str(project.get("feature_index_dir", "")))
+    required_index_files = ["config.json", "features.npy", "index.faiss"]
+    for filename in required_index_files:
+        path = feature_root / filename
+        append_validation_row(
+            rows,
+            f"feature_index/{filename}",
+            "OK" if path.exists() else "FAIL",
+            str(path) if path.exists() else f"not found: {path}",
+            "index",
+        )
+
+    records_ready = index_records_ready(feature_root)
+    append_validation_row(
+        rows,
+        "feature_index/records",
+        "OK" if records_ready else "FAIL",
+        "records.json or records.jsonl+record_offsets.npy ready" if records_ready else f"records metadata not ready: {feature_root}",
+        "index",
+    )
+
+    config: Dict = {}
+    config_path = feature_root / "config.json"
+    if config_path.exists():
+        try:
+            with config_path.open("r", encoding="utf-8") as f:
+                config = json.load(f) or {}
+            append_validation_row(rows, "index config", "OK", f"loaded {config_path}", "index")
+        except Exception as exc:
+            append_validation_row(rows, "index config", "FAIL", f"failed to read config: {exc}", "index")
+
+    feature_rows = None
+    feature_dim = None
+    features_path = feature_root / "features.npy"
+    if features_path.exists():
+        try:
+            features = np.load(str(features_path), mmap_mode="r")
+            feature_rows = int(features.shape[0])
+            feature_dim = int(features.shape[1]) if len(features.shape) > 1 else 0
+            append_validation_row(rows, "features.npy shape", "OK", f"{feature_rows:,} x {feature_dim:,}", "index")
+        except Exception as exc:
+            append_validation_row(rows, "features.npy shape", "FAIL", str(exc), "index")
+
+    record_count = None
+    if records_ready:
+        try:
+            records = open_record_store(feature_root)
+            record_count = int(len(records))
+            append_validation_row(rows, "record count", "OK", f"{record_count:,}", "index")
+            for sample_idx in [0, max(0, record_count // 2), max(0, record_count - 1)] if record_count else []:
+                record = records[sample_idx]
+                exists = Path(record.image_path).exists()
+                append_validation_row(
+                    rows,
+                    f"sample image {sample_idx}",
+                    "OK" if exists else "WARN",
+                    str(record.image_path) if exists else f"image path not reachable: {record.image_path}",
+                    "data",
+                )
+        except Exception as exc:
+            append_validation_row(rows, "record count", "FAIL", str(exc), "index")
+
+    index_ntotal = None
+    index_path = feature_root / "index.faiss"
+    if index_path.exists():
+        try:
+            import faiss
+
+            faiss_index = faiss.read_index(str(index_path))
+            index_ntotal = int(faiss_index.ntotal)
+            append_validation_row(rows, "FAISS ntotal", "OK", f"{index_ntotal:,}", "index")
+        except Exception as exc:
+            append_validation_row(rows, "FAISS ntotal", "FAIL", str(exc), "index")
+
+    expected_records = int(config.get("num_records", 0) or 0)
+    if expected_records and feature_rows is not None:
+        append_validation_row(
+            rows,
+            "config num_records vs features",
+            "OK" if expected_records == feature_rows else "FAIL",
+            f"config={expected_records:,}, features={feature_rows:,}",
+            "consistency",
+        )
+    if record_count is not None and feature_rows is not None:
+        append_validation_row(
+            rows,
+            "records vs features",
+            "OK" if record_count == feature_rows else "FAIL",
+            f"records={record_count:,}, features={feature_rows:,}",
+            "consistency",
+        )
+    if index_ntotal is not None and feature_rows is not None:
+        append_validation_row(
+            rows,
+            "FAISS vs features",
+            "OK" if index_ntotal == feature_rows else "FAIL",
+            f"faiss={index_ntotal:,}, features={feature_rows:,}",
+            "consistency",
+        )
+    expected_dim = int(config.get("dim", 0) or 0)
+    if expected_dim and feature_dim is not None:
+        append_validation_row(
+            rows,
+            "config dim vs features",
+            "OK" if expected_dim == feature_dim else "FAIL",
+            f"config={expected_dim:,}, features={feature_dim:,}",
+            "consistency",
+        )
+
+    config_weights = str(config.get("weights_path", "") or "")
+    if config_weights:
+        status = "OK" if same_existing_path(str(project.get("weights_path", "")), config_weights) else "WARN"
+        append_validation_row(
+            rows,
+            "model vs index weights",
+            status,
+            f"project={project.get('weights_path', '')} | index={config_weights}",
+            "consistency",
+        )
+    config_repo = str(config.get("repo_path", "") or "")
+    if config_repo:
+        status = "OK" if same_existing_path(str(project.get("repo_path", "")), config_repo) else "WARN"
+        append_validation_row(
+            rows,
+            "repo vs index repo",
+            status,
+            f"project={project.get('repo_path', '')} | index={config_repo}",
+            "consistency",
+        )
+    if config_bool(config.get("faiss_gpu_requested", False)) and not config_bool(config.get("faiss_gpu_used", False)):
+        append_validation_row(rows, "FAISS GPU", "WARN", str(config.get("faiss_gpu_reason", "requested but not used")), "index")
+
+    return rows
+
+
+def metadata_log_root(project: Dict) -> Path:
+    return Path("artifacts") / "project_metadata_logs" / slugify(str(project.get("name", "project")))
+
+
+def start_project_metadata_build(project: Dict) -> int:
+    project = normalize_project(project)
+    log_root = metadata_log_root(project)
+    log_root.mkdir(parents=True, exist_ok=True)
+    for old_file in log_root.glob("metadata.*"):
+        try:
+            old_file.unlink()
+        except OSError:
+            pass
+    pid_path = log_root / "metadata.pid"
+    if pid_path.exists():
+        pid_path.unlink(missing_ok=True)
+
+    cmd = [
+        sys.executable,
+        "-u",
+        str(Path("scripts") / "build_record_metadata.py"),
+        "--index-dir",
+        str(project.get("feature_index_dir", "")),
+        "--summary-json",
+        str(log_root / "metadata_summary.json"),
+    ]
+    stdout = (log_root / "metadata.out.log").open("w", encoding="utf-8")
+    stderr = (log_root / "metadata.err.log").open("w", encoding="utf-8")
+    proc = subprocess.Popen(cmd, cwd=str(Path.cwd()), stdout=stdout, stderr=stderr)
+    stdout.close()
+    stderr.close()
+    pid_path.write_text(str(proc.pid), encoding="ascii")
+    return int(proc.pid)
+
+
+def metadata_progress_summary(project: Dict) -> Dict:
+    project = normalize_project(project)
+    log_root = metadata_log_root(project)
+    feature_root = Path(str(project.get("feature_index_dir", "")))
+    cache_path = feature_root / "record_meta_cache.npz"
+    pid = read_pid(log_root / "metadata.pid")
+    running = bool(pid and pid_is_running(pid))
+    progress = last_progress_from_log(log_root / "metadata.out.log")
+    stderr = tail_text(log_root / "metadata.err.log", lines=80)
+    summary_path = log_root / "metadata_summary.json"
+    summary = {}
+    if summary_path.exists():
+        try:
+            with summary_path.open("r", encoding="utf-8") as f:
+                summary = json.load(f) or {}
+        except Exception:
+            summary = {}
+
+    if cache_path.exists() and not running:
+        stage = "Ready"
+        pct = 1.0
+        eta_seconds = 0
+    elif stderr.strip() and not running:
+        stage = "Failed"
+        pct = 0.0
+        eta_seconds = None
+    elif running:
+        stage = "Building"
+        pct = float(progress["pct"]) / 100.0 if progress else 0.0
+        eta_seconds = progress.get("eta_seconds") if progress else None
+    elif pid:
+        stage = "Stopped"
+        pct = float(progress["pct"]) / 100.0 if progress else 0.0
+        eta_seconds = None
+    else:
+        stage = "Not built"
+        pct = 0.0
+        eta_seconds = None
+
+    finish_time = ""
+    if eta_seconds and eta_seconds > 0:
+        finish_time = (datetime.now() + timedelta(seconds=int(eta_seconds))).strftime("%H:%M:%S")
+    return {
+        "log_root": log_root,
+        "cache_path": cache_path,
+        "pid": pid,
+        "running": running,
+        "stage": stage,
+        "pct": max(0.0, min(1.0, pct)),
+        "eta_seconds": eta_seconds,
+        "finish_time": finish_time,
+        "progress": progress,
+        "stderr": stderr,
+        "summary": summary,
+    }
+
+
+def metadata_status_panel(project: Dict, compact: bool = False) -> None:
+    summary = metadata_progress_summary(project)
+    if compact:
+        st.caption(
+            f"Class/size metadata: {summary['stage']} | "
+            f"progress={summary['pct'] * 100:.1f}% | log={summary['log_root']}"
+        )
+    else:
+        st.subheader("Class/Size Metadata")
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Metadata", summary["stage"])
+        with col2:
+            st.metric("Progress", f"{summary['pct'] * 100:.1f}%")
+        with col3:
+            eta_seconds = summary.get("eta_seconds")
+            st.metric("Remaining", format_duration(int(eta_seconds)) if eta_seconds is not None else "-")
+        with col4:
+            st.metric("ETA finish", summary.get("finish_time") or "-")
+        st.progress(float(summary["pct"]))
+        st.caption(f"Metadata log: {summary['log_root']}")
+        if summary.get("pid"):
+            st.caption(f"Metadata PID: {summary['pid']} | running={summary['running']}")
+        if summary.get("progress"):
+            st.caption(str(summary["progress"].get("message", "")))
+        if summary.get("summary"):
+            st.caption(f"Records: {int(summary['summary'].get('total_records', 0)):,}")
+        if summary.get("stderr", "").strip():
+            with st.expander("Metadata errors", expanded=True):
+                st.code(summary["stderr"], language="text")
+
+
 def tail_text(path: Path, lines: int = 40) -> str:
     if not path.exists():
         return ""
@@ -3367,6 +3647,22 @@ def project_manager_tab(config: Dict) -> None:
     if blocking_preflight:
         st.error("Build cannot start until FAIL items are fixed.")
 
+    validate_key = f"project_validation_{slugify(str(project.get('name', 'project')))}"
+    validate_col1, validate_col2 = st.columns([1, 3])
+    with validate_col1:
+        if st.button("Run Project Validate", key="btn_run_project_validate", use_container_width=True):
+            with st.spinner("Validating project, feature index, and FAISS consistency..."):
+                st.session_state[validate_key] = project_validation_rows(project)
+    with validate_col2:
+        st.caption("Checks paths, model/index consistency, feature shape, FAISS ntotal, records, and sample image reachability.")
+    validation_rows = st.session_state.get(validate_key, [])
+    if validation_rows:
+        validation_df = pd.DataFrame(validation_rows)
+        fail_count = int((validation_df["status"] == "FAIL").sum())
+        warn_count = int((validation_df["status"] == "WARN").sum())
+        st.caption(f"Validation result: FAIL={fail_count}, WARN={warn_count}, rows={len(validation_df):,}")
+        st.dataframe(validation_df, use_container_width=True, hide_index=True)
+
     build_col1, build_col2, build_col3, build_col4, build_col5 = st.columns([1, 1, 1, 1, 2])
     with build_col1:
         default_build_device = "0" if config["device"] == "cuda" else "cpu"
@@ -3463,6 +3759,21 @@ def project_manager_tab(config: Dict) -> None:
         st.rerun()
 
     project_build_status(project)
+    metadata_status_panel(project, compact=False)
+    metadata_col1, metadata_col2 = st.columns(2)
+    with metadata_col1:
+        if st.button("Start Class/Size Metadata Build", key="btn_start_project_metadata", use_container_width=True):
+            if not index_ready(project):
+                st.error("Feature index is not ready. Build/load the index before building metadata.")
+            else:
+                pid = start_project_metadata_build(project)
+                st.success(f"Metadata build started: PID {pid}")
+                st.rerun()
+    with metadata_col2:
+        if st.button("Refresh Class/Size Metadata", key="btn_refresh_project_metadata", use_container_width=True):
+            if metadata_progress_summary(project).get("stage") == "Ready":
+                cached_cluster_metadata.clear()
+            st.rerun()
 
 
 def video_detection_tab(project: Dict, config: Dict) -> None:

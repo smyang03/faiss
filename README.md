@@ -26,6 +26,9 @@ The main workflow is:
 - Optional FAISS GPU train/add path when `faiss-gpu` is available.
 - Exact reranking from saved `features.npy` after IVFPQ candidate search.
 - Streamlit UI for project setup, crop search, video detection search, DB-neighbor search, and clustering.
+- Background class/size metadata cache build for large projects.
+- Project validation checks for model/index/record/FAISS consistency.
+- CLI health checks and browser-level UI regression checks.
 
 ## Install
 
@@ -162,6 +165,34 @@ index.faiss           FAISS index
 ```
 
 These generated files can be large and are intentionally excluded from git.
+
+## Metadata And Validation
+
+Large projects should build the class/size metadata cache once. This lets the clustering and calibration tabs show class filters and size counts without scanning every record on page load.
+
+```powershell
+python -u scripts/build_record_metadata.py `
+  --index-dir artifacts/yolo_feature_index_safety_env `
+  --summary-json artifacts/project_metadata_logs/safety_env/metadata_summary.json
+```
+
+The same job can be started from the UI with `Start Class/Size Metadata Build`.
+
+Run smoke/health checks:
+
+```powershell
+python -u scripts/run_health_check.py `
+  --index-dir artifacts/yolo_feature_index_safety_env `
+  --output-dir artifacts/health_checks/safety_env
+```
+
+Run browser-level Streamlit regression checks against a running app:
+
+```powershell
+python -u scripts/run_ui_regression.py `
+  --url http://localhost:8501 `
+  --output-dir artifacts/ui_regression/latest
+```
 
 ## Notes
 
