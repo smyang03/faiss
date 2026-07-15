@@ -23,7 +23,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 try:
     from streamlit_plotly_events import plotly_events
 except Exception:
@@ -627,6 +627,29 @@ def record_from_state(data: Dict) -> CropRecord:
     return CropRecord(**item)
 
 
+def record_from_csv_row(row) -> CropRecord:
+    bbox = getattr(row, "bbox_xyxy", [0, 0, 1, 1])
+    if isinstance(bbox, str):
+        try:
+            parsed = json.loads(bbox)
+        except Exception:
+            parsed = [int(value) for value in re.findall(r"-?\d+", bbox)[:4]]
+        bbox_values = parsed if len(parsed) >= 4 else [0, 0, 1, 1]
+    else:
+        bbox_values = list(bbox)
+    return CropRecord(
+        record_id=int(getattr(row, "record_id", getattr(row, "record_idx", 0))),
+        image_path=str(getattr(row, "image_path", "")),
+        label_path=str(getattr(row, "label_path", "")),
+        class_id=int(getattr(row, "class_id", 0)),
+        class_name=str(getattr(row, "class_name", "")),
+        bbox_xyxy=tuple(int(float(value)) for value in bbox_values[:4]),
+        image_width=int(float(getattr(row, "image_width", 1) or 1)),
+        image_height=int(float(getattr(row, "image_height", 1) or 1)),
+        annotation_line=int(float(getattr(row, "annotation_line", 0) or 0)),
+    )
+
+
 def request_db_neighbor_search(record: CropRecord, top_k: int) -> None:
     st.session_state["pending_db_neighbor_record"] = record_to_state(record)
     st.session_state["pending_db_neighbor_top_k"] = int(max(5, min(100, top_k)))
@@ -818,7 +841,7 @@ def render_selected_paths_panel(key_prefix: str = "selected_paths") -> None:
             st.rerun()
 
 
-def render_preview_image() -> None:
+def render_preview_image(key_prefix: str = "preview") -> None:
     image = st.session_state.get("preview_image")
     if image is None:
         return
@@ -830,10 +853,17 @@ def render_preview_image() -> None:
     with col_meta:
         width, height = image.size
         st.caption(f"size={width}x{height}")
-        if st.button("Close preview", key="btn_close_preview"):
+        if st.button("Close preview", key=f"{key_prefix}_btn_close_preview"):
             st.session_state["preview_image"] = None
             st.session_state["preview_caption"] = ""
             st.rerun()
+
+
+def render_full_width_image(image: Image.Image, caption: str = "") -> None:
+    try:
+        st.image(image, caption=caption, use_container_width=True)
+    except TypeError:
+        st.image(image, caption=caption, use_column_width=True)
 
 
 def result_rows(results: List[Dict]) -> pd.DataFrame:
@@ -2383,7 +2413,7 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
     render_selected_paths_panel(key_prefix="cluster_selected_paths")
     run_pending_db_neighbor_search(project, config)
     render_db_neighbor_results("cluster")
-    render_preview_image()
+    render_preview_image("db_neighbor_preview")
 
 
 def crop_search_tab(project: Dict, config: Dict) -> None:
@@ -4412,7 +4442,7 @@ def calibration_tab(project: Dict, config: Dict) -> None:
     render_selected_paths_panel(key_prefix="calibration_selected_paths")
     run_pending_db_neighbor_search(project, config)
     render_db_neighbor_results("calibration")
-    render_preview_image()
+    render_preview_image("calibration_preview")
 
 
 def curation_report_root(project: Dict) -> Path:
@@ -4486,6 +4516,608 @@ def render_report_csv_preview(report_dir: Path, filename: str, title: str, key_p
         )
     except Exception:
         pass
+
+
+def render_reduction_record_card(row, key_prefix: str, title: str, badge: str, compact: bool = True) -> None:
+    record = record_from_csv_row(row)
+    meta = f"{record.class_id} {record.class_name} | {Path(record.image_path).name}"
+    if hasattr(row, "similarity_to_primary") and pd.notna(getattr(row, "similarity_to_primary")):
+        meta = f"sim={float(getattr(row, 'similarity_to_primary')):.4f} | {meta}"
+    open_card(title=title, meta=meta, compact=compact)
+    thumb_ok = render_record_thumb(record, badge=badge)
+    if not thumb_ok:
+        st.caption("crop load failed")
+    if thumb_ok and st.button("View", key=f"{key_prefix}_view", use_container_width=True):
+        set_preview_image(
+            crop_from_record(record),
+            f"{title} | {record.class_id} {record.class_name} | {Path(record.image_path).name}",
+        )
+        st.rerun()
+    if st.button("Data", key=f"{key_prefix}_data", use_container_width=True):
+        open_data_location(record.image_path)
+    render_path_selector(record.image_path, record, key=f"{key_prefix}_select")
+    close_card()
+
+
+def boolish_series(series: pd.Series) -> pd.Series:
+    if series.dtype == bool:
+        return series.fillna(False)
+    return series.fillna(False).astype(str).str.lower().isin({"true", "1", "yes", "y", "on"})
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if pd.isna(value):
+            return default
+        return int(float(value))
+    except Exception:
+        return default
+
+
+def reduction_action_color(action: str) -> tuple:
+    action_text = str(action or "").upper()
+    if action_text.startswith("DROP"):
+        return (248, 113, 113)
+    if "PROTECT" in action_text:
+        return (251, 191, 36)
+    if "REPRESENTATIVE" in action_text:
+        return (52, 211, 153)
+    return (125, 211, 252)
+
+
+def load_record_crop_for_sheet(row, size: int) -> Image.Image:
+    record = record_from_csv_row(row)
+    frame = Image.new("RGB", (size, size), (6, 20, 34))
+    try:
+        with Image.open(record.image_path) as img:
+            crop = img.convert("RGB").crop(tuple(int(v) for v in record.bbox_xyxy))
+        longest = max(1, crop.width, crop.height)
+        scale = (size - 8) / float(longest)
+        resized = crop.resize(
+            (max(1, int(round(crop.width * scale))), max(1, int(round(crop.height * scale)))),
+            getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC),
+        )
+        frame.paste(resized, ((size - resized.width) // 2, (size - resized.height) // 2))
+    except Exception:
+        draw = ImageDraw.Draw(frame)
+        draw.rectangle((0, 0, size - 1, size - 1), outline=(80, 106, 136), width=2)
+        draw.text((18, size // 2 - 8), "crop load failed", fill=(226, 232, 240), font=sheet_font(14))
+    return frame
+
+
+def sheet_font(size: int, bold: bool = False) -> ImageFont.ImageFont:
+    candidates = [
+        "arialbd.ttf" if bold else "arial.ttf",
+        "C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/malgunbd.ttf" if bold else "C:/Windows/Fonts/malgun.ttf",
+    ]
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def ellipsize_text(text: Any, max_chars: int) -> str:
+    value = str(text or "")
+    if len(value) <= max_chars:
+        return value
+    return value[: max(1, max_chars - 3)] + "..."
+
+
+def draw_sheet_label(draw: ImageDraw.ImageDraw, xy: tuple, text: str, font: ImageFont.ImageFont, fill: tuple, max_chars: int) -> None:
+    draw.text(xy, ellipsize_text(text, max_chars), fill=fill, font=font)
+
+
+def build_reduction_evidence_sheet(group_members: pd.DataFrame, max_candidates: int = 12) -> Optional[Image.Image]:
+    if group_members.empty:
+        return None
+
+    group_members = group_members.copy()
+    if "is_representative" in group_members.columns:
+        rep_mask = boolish_series(group_members["is_representative"])
+    else:
+        rep_mask = pd.Series([False] * len(group_members), index=group_members.index)
+    reps = group_members[rep_mask].copy()
+    if reps.empty:
+        reps = group_members.head(1).copy()
+    primary = reps.iloc[0]
+
+    others = group_members.drop(index=reps.index, errors="ignore").copy()
+    if "action" in others.columns:
+        others["_drop_rank"] = others["action"].astype(str).str.startswith("DROP").astype(int)
+    else:
+        others["_drop_rank"] = 0
+    if "similarity_to_primary" in others.columns:
+        others["_sim"] = others["similarity_to_primary"].map(lambda value: safe_float(value, 0.0))
+    else:
+        others["_sim"] = 0.0
+    others = others.sort_values(["_drop_rank", "_sim"], ascending=[False, False]).head(int(max_candidates))
+    nodes = [primary] + [row for _, row in others.iterrows()]
+
+    thumb = 176
+    header_h = 76
+    label_h = 58
+    cols = 4 if len(others) >= 4 else max(1, len(others))
+    rows = max(1, int(np.ceil(max(1, len(others)) / max(1, cols))))
+    width = 1520
+    height = max(520, header_h + rows * (thumb + label_h + 30) + 58)
+    bg = (7, 17, 31)
+    canvas = Image.new("RGB", (width, height), bg)
+    draw = ImageDraw.Draw(canvas)
+    title_font = sheet_font(26, bold=True)
+    body_font = sheet_font(17)
+    small_font = sheet_font(14)
+    label_font = sheet_font(15, bold=True)
+
+    group_id = safe_int(getattr(primary, "reduction_group_id", 0))
+    class_name = str(getattr(primary, "class_name", ""))
+    group_size = len(group_members)
+    drop_count = int(group_members["action"].astype(str).str.startswith("DROP").sum()) if "action" in group_members.columns else 0
+    min_sim = group_members["similarity_to_primary"].map(lambda value: safe_float(value, 0.0)).min() if "similarity_to_primary" in group_members.columns else 0.0
+    mean_sim = group_members["similarity_to_primary"].map(lambda value: safe_float(value, 0.0)).mean() if "similarity_to_primary" in group_members.columns else 0.0
+    draw.text((34, 22), f"Reduction evidence group G{group_id}", fill=(248, 250, 252), font=title_font)
+    draw.text(
+        (470, 28),
+        f"class={class_name} | members={group_size:,} | drop candidates={drop_count:,} | sim min/mean={min_sim:.4f}/{mean_sim:.4f}",
+        fill=(156, 199, 232),
+        font=body_font,
+    )
+    draw.line((30, header_h - 8, width - 30, header_h - 8), fill=(29, 58, 87), width=2)
+
+    rep_x = 60
+    rep_y = header_h + (height - header_h - thumb - label_h) // 2
+    candidate_start_x = 430
+    candidate_start_y = header_h + 28
+    cell_w = 255
+    cell_h = thumb + label_h + 30
+    positions = [(rep_x, rep_y)]
+    for idx in range(len(others)):
+        col = idx % cols
+        row = idx // cols
+        positions.append((candidate_start_x + col * cell_w, candidate_start_y + row * cell_h))
+
+    rep_center = (rep_x + thumb, rep_y + thumb // 2)
+    for idx, row in enumerate(nodes[1:], start=1):
+        x, y = positions[idx]
+        action = str(getattr(row, "action", ""))
+        color = reduction_action_color(action)
+        sim = safe_float(getattr(row, "similarity_to_primary", 0.0), 0.0)
+        line_width = max(2, min(7, int(round((sim - 0.95) * 100)))) if sim > 0 else 2
+        end = (x, y + thumb // 2)
+        draw.line((rep_center[0], rep_center[1], end[0], end[1]), fill=color, width=line_width)
+        label_x = int((rep_center[0] + end[0]) / 2) - 24
+        label_y = int((rep_center[1] + end[1]) / 2) - 12
+        draw.rounded_rectangle((label_x - 8, label_y - 3, label_x + 74, label_y + 22), radius=8, fill=(6, 20, 34), outline=color)
+        draw.text((label_x, label_y), f"{sim:.3f}", fill=(248, 250, 252), font=small_font)
+
+    for idx, row in enumerate(nodes):
+        x, y = positions[idx]
+        action = str(getattr(row, "action", "KEEP_REPRESENTATIVE" if idx == 0 else ""))
+        color = reduction_action_color(action)
+        crop = load_record_crop_for_sheet(row, thumb)
+        canvas.paste(crop, (x, y))
+        draw.rounded_rectangle((x - 3, y - 3, x + thumb + 3, y + thumb + 3), radius=10, outline=color, width=4)
+        tag = "REP" if idx == 0 else ("DROP" if action.startswith("DROP") else "KEEP")
+        draw.rounded_rectangle((x + 8, y + 8, x + 84, y + 34), radius=8, fill=(6, 20, 34), outline=color)
+        draw.text((x + 16, y + 13), tag, fill=(248, 250, 252), font=small_font)
+        sim = safe_float(getattr(row, "similarity_to_primary", 1.0 if idx == 0 else 0.0), 0.0)
+        file_name = Path(str(getattr(row, "image_path", getattr(row, "file_name", "")))).name
+        draw_sheet_label(draw, (x, y + thumb + 12), f"{safe_int(getattr(row, 'class_id', 0))} {getattr(row, 'class_name', '')} | {sim:.4f}", label_font, (226, 232, 240), 29)
+        draw_sheet_label(draw, (x, y + thumb + 34), file_name, small_font, (156, 199, 232), 31)
+
+    draw.text(
+        (34, height - 30),
+        "Lines connect the kept representative to visually similar candidates. Red lines are records planned for removal; amber/cyan are retained for protection/review.",
+        fill=(148, 163, 184),
+        font=small_font,
+    )
+    return canvas
+
+
+def render_reduction_flow_chart(summary: Dict) -> None:
+    planned = int(summary.get("planned_records", 0) or 0)
+    reps = int(summary.get("representative_records", 0) or 0)
+    protected = int(summary.get("protected_records", 0) or 0)
+    drops = int(summary.get("drop_record_candidates", 0) or 0)
+    other_keep = max(0, planned - reps - protected - drops)
+    if planned <= 0:
+        return
+    labels = ["Planned records", "Keep representatives", "Keep protected", "Keep other", "Drop candidates"]
+    values = [reps, protected, other_keep, drops]
+    colors = ["rgba(52,211,153,0.55)", "rgba(251,191,36,0.55)", "rgba(125,211,252,0.45)", "rgba(248,113,113,0.58)"]
+    fig = go.Figure(
+        data=[
+            go.Sankey(
+                arrangement="fixed",
+                node=dict(
+                    pad=18,
+                    thickness=18,
+                    line=dict(color="rgba(226,232,240,0.35)", width=0.5),
+                    label=labels,
+                    color=["rgba(148,163,184,0.75)", *colors],
+                ),
+                link=dict(
+                    source=[0, 0, 0, 0],
+                    target=[1, 2, 3, 4],
+                    value=values,
+                    color=colors,
+                ),
+            )
+        ]
+    )
+    fig.update_layout(
+        title="Record Flow: What Stays vs What Becomes Reduction Candidate",
+        height=320,
+        margin=dict(l=20, r=20, t=50, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e5f3ff", size=12),
+    )
+    st.plotly_chart(fig, use_container_width=True, key="reduction_flow_sankey")
+
+
+def image_to_png_bytes(image: Image.Image) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def render_reduction_visual_review(plan_dir: Path) -> None:
+    st.subheader("Visual Review")
+    st.caption("Inspect the removed candidates before using the manifest/copy export. Cards show bbox crops, not full images.")
+
+    members_path = plan_dir / "reduction_group_members.csv"
+    groups_path = plan_dir / "reduction_groups.csv"
+    drops_path = plan_dir / "reduction_drop_records.csv"
+    if not members_path.exists() or not groups_path.exists() or not drops_path.exists():
+        st.info("Build a reduction plan first.")
+        return
+
+    try:
+        groups = pd.read_csv(groups_path)
+        members = pd.read_csv(members_path)
+        drops = pd.read_csv(drops_path)
+    except Exception as exc:
+        st.warning(f"Failed to load reduction visual data: {exc}")
+        return
+
+    summary = load_reduction_summary(str(plan_dir))
+
+    review_tab0, review_tab1, review_tab2, review_tab3 = st.tabs(["Overview", "Evidence Map", "Drop Gallery", "Group Compare"])
+    with review_tab0:
+        st.caption("Use this overview to understand what would disappear before inspecting individual crops.")
+        overview_col1, overview_col2, overview_col3 = st.columns(3)
+        with overview_col1:
+            st.metric("Drop records", f"{len(drops):,}")
+        with overview_col2:
+            st.metric("Tight groups", f"{len(groups):,}")
+        with overview_col3:
+            if not groups.empty:
+                st.metric("Largest group", f"{int(groups['group_size'].max()):,}")
+            else:
+                st.metric("Largest group", "0")
+
+        render_reduction_flow_chart(summary)
+
+        chart_col1, chart_col2 = st.columns(2)
+        if not members.empty:
+            action_df = (
+                members.groupby(["class_name", "action"], as_index=False)
+                .size()
+                .rename(columns={"size": "count"})
+                .sort_values(["class_name", "action"])
+            )
+            with chart_col1:
+                fig = go.Figure()
+                for action, sub in action_df.groupby("action"):
+                    fig.add_bar(x=sub["class_name"], y=sub["count"], name=str(action))
+                fig.update_layout(
+                    title="Record Actions By Class",
+                    barmode="stack",
+                    height=360,
+                    margin=dict(l=20, r=20, t=50, b=70),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    font=dict(color="#e5f3ff"),
+                    legend=dict(orientation="h"),
+                )
+                st.plotly_chart(fig, use_container_width=True, key="reduction_overview_action_chart")
+        if (plan_dir / "reduction_image_plan.csv").exists():
+            try:
+                image_plan = pd.read_csv(plan_dir / "reduction_image_plan.csv")
+                image_actions = image_plan["image_action"].astype(str).value_counts().reset_index()
+                image_actions.columns = ["image_action", "count"]
+                with chart_col2:
+                    fig = go.Figure(
+                        data=[
+                            go.Pie(
+                                labels=image_actions["image_action"],
+                                values=image_actions["count"],
+                                hole=0.45,
+                            )
+                        ]
+                    )
+                    fig.update_layout(
+                        title="Image Keep / Drop Plan",
+                        height=360,
+                        margin=dict(l=20, r=20, t=50, b=20),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        font=dict(color="#e5f3ff"),
+                    )
+                    st.plotly_chart(fig, use_container_width=True, key="reduction_overview_image_chart")
+            except Exception as exc:
+                st.caption(f"Image action chart unavailable: {exc}")
+
+        if not groups.empty:
+            st.subheader("Tight Group Map")
+            fig = go.Figure()
+            for class_name, sub in groups.groupby("class_name"):
+                fig.add_trace(
+                    go.Scattergl(
+                        x=sub["group_size"],
+                        y=sub["mean_similarity_to_primary"],
+                        mode="markers",
+                        name=str(class_name),
+                        marker=dict(
+                            size=np.clip(np.sqrt(sub["drop_candidates"].astype(float).to_numpy()) * 2.2 + 5, 5, 34),
+                            opacity=0.78,
+                        ),
+                        customdata=np.stack(
+                            [
+                                sub["reduction_group_id"].astype(str).to_numpy(),
+                                sub["drop_candidates"].astype(str).to_numpy(),
+                                sub["representative_file"].astype(str).to_numpy(),
+                            ],
+                            axis=1,
+                        ),
+                        hovertemplate=(
+                            "group=%{customdata[0]}<br>"
+                            "size=%{x}<br>"
+                            "mean sim=%{y:.4f}<br>"
+                            "drop=%{customdata[1]}<br>"
+                            "%{customdata[2]}<extra></extra>"
+                        ),
+                    )
+                )
+            fig.update_layout(
+                title="Group Size vs Mean Similarity",
+                xaxis_title="group size",
+                yaxis_title="mean similarity to representative",
+                height=480,
+                margin=dict(l=20, r=20, t=50, b=50),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e5f3ff"),
+                legend=dict(orientation="h"),
+            )
+            st.plotly_chart(fig, use_container_width=True, key="reduction_overview_group_scatter")
+
+    with review_tab1:
+        if groups.empty:
+            st.info("No tight groups available.")
+            return
+        st.caption(
+            "This sheet is the visual proof view: one kept representative is connected to similar records that the plan can remove or protect."
+        )
+        evidence_groups = groups.copy()
+        if "drop_candidates" in evidence_groups.columns:
+            evidence_groups["_drop_candidates"] = evidence_groups["drop_candidates"].map(lambda value: safe_int(value, 0))
+        else:
+            evidence_groups["_drop_candidates"] = 0
+        if "mean_similarity_to_primary" in evidence_groups.columns:
+            evidence_groups["_mean_sim"] = evidence_groups["mean_similarity_to_primary"].map(lambda value: safe_float(value, 0.0))
+        else:
+            evidence_groups["_mean_sim"] = 0.0
+        evidence_groups = evidence_groups.sort_values(["_drop_candidates", "_mean_sim"], ascending=[False, False]).head(1000)
+        evidence_groups["label"] = evidence_groups.apply(
+            lambda row: (
+                f"G{safe_int(row.get('reduction_group_id', 0))} | "
+                f"drop={safe_int(row.get('drop_candidates', 0))} | "
+                f"n={safe_int(row.get('group_size', 0))} | "
+                f"sim={safe_float(row.get('mean_similarity_to_primary', 0.0)):.4f} | "
+                f"{row.get('class_name', '')} | {row.get('representative_file', '')}"
+            ),
+            axis=1,
+        )
+        evidence_col1, evidence_col2, evidence_col3 = st.columns([2, 1, 1])
+        with evidence_col1:
+            evidence_label = st.selectbox(
+                "Evidence group",
+                evidence_groups["label"].tolist(),
+                key="reduction_evidence_group_select",
+            )
+        with evidence_col2:
+            evidence_cards = st.number_input(
+                "Connected candidates",
+                min_value=4,
+                max_value=24,
+                value=12,
+                step=2,
+                key="reduction_evidence_connected_candidates",
+            )
+        with evidence_col3:
+            include_table = st.checkbox("Show evidence rows", value=True, key="reduction_evidence_show_rows")
+
+        selected_group_id = safe_int(evidence_groups[evidence_groups["label"] == evidence_label]["reduction_group_id"].iloc[0])
+        evidence_members = members[members["reduction_group_id"].astype(int) == selected_group_id].copy()
+        if evidence_members.empty:
+            st.warning("Selected group has no member rows.")
+        else:
+            e1, e2, e3, e4 = st.columns(4)
+            with e1:
+                st.metric("Group records", f"{len(evidence_members):,}")
+            with e2:
+                drop_records = int(evidence_members["action"].astype(str).str.startswith("DROP").sum())
+                st.metric("Drop candidates", f"{drop_records:,}")
+            with e3:
+                sims = evidence_members["similarity_to_primary"].map(lambda value: safe_float(value, 0.0))
+                st.metric("Min similarity", f"{float(sims.min()):.4f}")
+            with e4:
+                st.metric("Mean similarity", f"{float(sims.mean()):.4f}")
+            sheet = build_reduction_evidence_sheet(evidence_members, max_candidates=int(evidence_cards))
+            if sheet is None:
+                st.warning("Could not build evidence sheet.")
+            else:
+                render_full_width_image(sheet, caption=f"Reduction evidence map | group={selected_group_id}")
+                st.download_button(
+                    "Download evidence PNG",
+                    image_to_png_bytes(sheet),
+                    file_name=f"reduction_evidence_group_{selected_group_id}.png",
+                    mime="image/png",
+                    key=f"reduction_evidence_png_{selected_group_id}_{int(evidence_cards)}",
+                    use_container_width=True,
+                )
+            if include_table:
+                columns = [
+                    col
+                    for col in [
+                        "record_idx",
+                        "action",
+                        "is_representative",
+                        "is_protected",
+                        "similarity_to_primary",
+                        "class_id",
+                        "class_name",
+                        "size_bucket",
+                        "file_name",
+                        "image_path",
+                    ]
+                    if col in evidence_members.columns
+                ]
+                st.dataframe(
+                    evidence_members[columns].head(200),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=300,
+                    key=f"reduction_evidence_rows_{selected_group_id}",
+                )
+
+    with review_tab2:
+        if drops.empty:
+            st.info("No drop candidates in this plan.")
+            return
+        f1, f2, f3, f4 = st.columns(4)
+        with f1:
+            classes = ["All"] + sorted(drops["class_name"].dropna().astype(str).unique().tolist())
+            selected_class = st.selectbox("Drop class", classes, key="reduction_visual_drop_class")
+        with f2:
+            actions = ["All"] + sorted(drops["action"].dropna().astype(str).unique().tolist())
+            selected_action = st.selectbox("Drop action", actions, key="reduction_visual_drop_action")
+        with f3:
+            sort_mode = st.selectbox(
+                "Drop sort",
+                ["Highest similarity", "Lowest similarity", "Largest group", "Random"],
+                key="reduction_visual_drop_sort",
+            )
+        with f4:
+            max_cards = st.number_input("Cards", min_value=4, max_value=80, value=24, step=4, key="reduction_visual_drop_cards")
+
+        gallery = drops.copy()
+        if selected_class != "All":
+            gallery = gallery[gallery["class_name"].astype(str) == str(selected_class)]
+        if selected_action != "All":
+            gallery = gallery[gallery["action"].astype(str) == str(selected_action)]
+        if gallery.empty:
+            st.warning("No drop candidates match the current filters.")
+        else:
+            if "similarity_to_primary" in gallery.columns and sort_mode == "Highest similarity":
+                gallery = gallery.sort_values("similarity_to_primary", ascending=False)
+            elif "similarity_to_primary" in gallery.columns and sort_mode == "Lowest similarity":
+                gallery = gallery.sort_values("similarity_to_primary", ascending=True)
+            elif sort_mode == "Largest group" and "reduction_group_id" in gallery.columns and not groups.empty:
+                group_sizes = groups.set_index("reduction_group_id")["group_size"].to_dict()
+                gallery["_group_size"] = gallery["reduction_group_id"].map(group_sizes).fillna(0)
+                gallery = gallery.sort_values("_group_size", ascending=False)
+            elif sort_mode == "Random":
+                gallery = gallery.sample(frac=1.0, random_state=42)
+            gallery = gallery.head(int(max_cards))
+            st.caption(f"showing {len(gallery):,} / {len(drops):,} drop candidates")
+            cols = st.columns(4)
+            for pos, row in enumerate(gallery.itertuples(index=False)):
+                with cols[pos % 4]:
+                    sim = getattr(row, "similarity_to_primary", None)
+                    badge = f"DROP {float(sim):.3f}" if sim is not None and pd.notna(sim) else "DROP"
+                    render_reduction_record_card(
+                        row,
+                        key_prefix=f"reduction_drop_gallery_{pos}_{getattr(row, 'record_idx', pos)}",
+                        title=f"G{getattr(row, 'reduction_group_id', '')} | drop",
+                        badge=badge,
+                    )
+
+    with review_tab3:
+        if groups.empty:
+            st.info("No tight groups available.")
+            return
+        group_display = groups.copy()
+        group_display["label"] = group_display.apply(
+            lambda row: (
+                f"G{int(row['reduction_group_id'])} | n={int(row['group_size'])} | "
+                f"drop={int(row['drop_candidates'])} | {row.get('class_name', '')} | {row.get('size_buckets', '')}"
+            ),
+            axis=1,
+        )
+        top_n = min(500, len(group_display))
+        group_display = group_display.head(top_n)
+        selected_label = st.selectbox(
+            "Reduction group",
+            group_display["label"].tolist(),
+            key="reduction_visual_group_select",
+        )
+        selected_group_id = int(group_display[group_display["label"] == selected_label]["reduction_group_id"].iloc[0])
+        group_members = members[members["reduction_group_id"].astype(int) == selected_group_id].copy()
+        if group_members.empty:
+            st.warning("Selected group has no member rows.")
+            return
+        group_members = group_members.sort_values(["is_representative", "action", "similarity_to_primary"], ascending=[False, True, False])
+        st.caption(
+            f"group={selected_group_id} | members={len(group_members):,} | "
+            f"drop={(group_members['action'].astype(str).str.startswith('DROP')).sum():,}"
+        )
+        rep_mask = boolish_series(group_members["is_representative"])
+        reps = group_members[rep_mask]
+        others = group_members[~rep_mask]
+        compare_cols = st.columns([1, 3])
+        with compare_cols[0]:
+            st.markdown("**Representative**")
+            for pos, row in enumerate(reps.head(3).itertuples(index=False)):
+                render_reduction_record_card(
+                    row,
+                    key_prefix=f"reduction_group_rep_{selected_group_id}_{pos}_{getattr(row, 'record_idx', pos)}",
+                    title=f"G{selected_group_id} | representative",
+                    badge="KEEP REP",
+                )
+        with compare_cols[1]:
+            st.markdown("**Drop / Protected Candidates**")
+            max_members = st.number_input(
+                "Group member cards",
+                min_value=4,
+                max_value=80,
+                value=24,
+                step=4,
+                key="reduction_visual_group_cards",
+            )
+            member_cols = st.columns(4)
+            for pos, row in enumerate(others.head(int(max_members)).itertuples(index=False)):
+                with member_cols[pos % 4]:
+                    action = str(getattr(row, "action", ""))
+                    sim = getattr(row, "similarity_to_primary", None)
+                    badge = f"{'DROP' if action.startswith('DROP') else 'KEEP'} {float(sim):.3f}" if sim is not None and pd.notna(sim) else action
+                    render_reduction_record_card(
+                        row,
+                        key_prefix=f"reduction_group_member_{selected_group_id}_{pos}_{getattr(row, 'record_idx', pos)}",
+                        title=f"G{selected_group_id} | {action}",
+                        badge=badge,
+                    )
 
 
 def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) -> None:
@@ -4656,23 +5288,45 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
     if summary.get("partial_plan"):
         st.warning("This is a sampled reduction plan. Record-level candidates are useful for review, but image deletion/export exclusions are disabled for sample-only drops.")
 
-    red_tab1, red_tab2, red_tab3, red_tab4, red_tab5 = st.tabs(
-        ["Groups", "Members", "Drop/Keep", "Images", "Export"]
+    red_tab1, red_tab2, red_tab3, red_tab4, red_tab5, red_tab6 = st.tabs(
+        ["Visual", "Groups", "Members", "Drop/Keep", "Images", "Export"]
     )
     with red_tab1:
+        render_reduction_visual_review(selected_plan_path)
+    with red_tab2:
         render_report_csv_preview(selected_plan_path, "reduction_groups.csv", "Tight Reduction Groups", "reduction_groups")
         render_report_csv_preview(selected_plan_path, "reduction_tight_edges.csv", "Tight Similarity Edges", "reduction_edges")
-    with red_tab2:
-        render_report_csv_preview(selected_plan_path, "reduction_group_members.csv", "Group Members", "reduction_members")
     with red_tab3:
+        render_report_csv_preview(selected_plan_path, "reduction_group_members.csv", "Group Members", "reduction_members")
+    with red_tab4:
         render_report_csv_preview(selected_plan_path, "reduction_drop_records.csv", "Drop Record Candidates", "reduction_drop_records")
         render_report_csv_preview(selected_plan_path, "reduction_keep_records.csv", "Keep Records", "reduction_keep_records")
-    with red_tab4:
-        render_report_csv_preview(selected_plan_path, "reduction_image_plan.csv", "Image-Level Plan", "reduction_images")
     with red_tab5:
+        render_report_csv_preview(selected_plan_path, "reduction_image_plan.csv", "Image-Level Plan", "reduction_images")
+    with red_tab6:
         st.subheader("Export Similarity-Reduced Dataset")
-        st.caption("Manifest mode is safest. Copy/hardlink exports images whose image-level action is not a safe drop candidate.")
-        export_col1, export_col2, export_col3 = st.columns(3)
+        st.caption("Manifest mode writes review lists only. Copy/hardlink creates a runnable reduced YOLO dataset.")
+        image_plan_path = selected_plan_path / "reduction_image_plan.csv"
+        if image_plan_path.exists():
+            try:
+                image_plan_preview = pd.read_csv(image_plan_path, usecols=["image_action"])
+                image_action_counts = image_plan_preview["image_action"].astype(str).value_counts().to_dict()
+                drop_images_preview = sum(
+                    int(count) for action, count in image_action_counts.items() if str(action).startswith("DROP")
+                )
+                keep_images_preview = int(len(image_plan_preview) - drop_images_preview)
+                x1, x2, x3, x4 = st.columns(4)
+                with x1:
+                    st.metric("Export keep images", f"{keep_images_preview:,}")
+                with x2:
+                    st.metric("Image drop candidates", f"{drop_images_preview:,}")
+                with x3:
+                    st.metric("Record drop candidates", f"{int(summary.get('drop_record_candidates', 0)):,}")
+                with x4:
+                    st.metric("Record reduction", f"{float(summary.get('record_reduction_pct_of_planned', 0.0)):.2f}%")
+            except Exception as exc:
+                st.caption(f"Export preview unavailable: {exc}")
+        export_col1, export_col2, export_col3, export_col4 = st.columns(4)
         with export_col1:
             export_name = st.text_input(
                 "Reduction export name",
@@ -4682,8 +5336,21 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
         with export_col2:
             export_mode = st.selectbox("Reduction export mode", ["manifest", "copy", "hardlink"], index=0, key="reduction_export_mode")
         with export_col3:
+            label_policy = st.selectbox(
+                "Label policy",
+                ["filtered", "original"],
+                index=0,
+                key="reduction_export_label_policy",
+                help="filtered rewrites YOLO txt labels with only kept annotations when the plan is full.",
+            )
+        with export_col4:
             export_dir = reduced_dataset_root(project) / f"similarity_{slugify(export_name)}"
             st.caption(f"Output: {export_dir}")
+        if str(export_mode) in {"copy", "hardlink"} and str(label_policy) == "filtered":
+            st.info(
+                "Filtered export rewrites YOLO txt files with only kept bbox records. "
+                "This is the actual reduced training dataset, not only an image list."
+            )
         if st.button("Export Similarity Reduction", key="btn_export_similarity_reduction", use_container_width=True):
             try:
                 result = export_similarity_reduction_plan(
@@ -4693,11 +5360,13 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
                     labels_root=str(project.get("labels_dir", "")),
                     data_yaml=str(project.get("data_yaml", "")),
                     mode=str(export_mode),
+                    label_policy=str(label_policy),
                 )
                 st.success(
                     f"Export complete: kept_images={result['kept_images']:,}, "
                     f"drop_images={result['drop_image_candidates']:,}, "
-                    f"drop_records={result['drop_record_candidates']:,}, output={result['output_dir']}"
+                    f"drop_records={result['drop_record_candidates']:,}, "
+                    f"labels={result['effective_label_policy']}, output={result['output_dir']}"
                 )
             except Exception as exc:
                 st.error(f"Reduction export failed: {exc}")
@@ -4949,10 +5618,10 @@ def search_page(config: Dict) -> None:
         crop_search_tab(project, config)
         run_pending_db_neighbor_search(project, config)
         render_db_neighbor_results("crop")
-        render_preview_image()
+        render_preview_image("crop_preview")
     with tab_video:
         video_detection_tab(project, config)
-        render_preview_image()
+        render_preview_image("video_preview")
     with tab_cluster:
         feature_cluster_tab(project, config)
     with tab_curation:
@@ -4966,7 +5635,7 @@ def search_page(config: Dict) -> None:
         show_results(st.session_state.get("last_results", []), key_prefix="last_results")
         run_pending_db_neighbor_search(project, config)
         render_db_neighbor_results("last")
-        render_preview_image()
+        render_preview_image("last_preview")
 
 
 def main() -> None:

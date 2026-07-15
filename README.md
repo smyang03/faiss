@@ -220,10 +220,15 @@ python -u scripts/export_similarity_reduction_plan.py `
   --images-root V:\dataset\images `
   --labels-root V:\dataset\labels `
   --data-yaml data.yaml `
-  --mode manifest
+  --mode copy `
+  --label-policy filtered
 ```
 
+`--label-policy filtered` rewrites YOLO txt labels with only kept annotations, so the extracted dataset is reduced at bbox/record level, not only at image level. For sampled plans, filtered labels are disabled automatically and original labels are kept for safety.
+
 The UI exposes the same workflow under `Curation Report` -> `Similarity Reduction Planner`.
+
+Use the `Visual` tab before exporting. `Overview` shows record-flow and class/action charts, `Evidence Map` renders the kept representative crop connected by similarity lines to drop/protected candidates, and `Group Compare` shows the same group as individual crop cards. This is the operator-facing proof view for checking that reduction candidates are visually redundant before running `copy` or `hardlink` export.
 
 ## Notes
 

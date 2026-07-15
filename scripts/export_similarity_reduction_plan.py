@@ -19,6 +19,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--labels-root", default="")
     parser.add_argument("--data-yaml", default="")
     parser.add_argument("--mode", choices=["manifest", "copy", "hardlink"], default="manifest")
+    parser.add_argument("--label-policy", choices=["filtered", "original"], default="filtered")
     return parser.parse_args()
 
 
@@ -31,6 +32,7 @@ def main() -> int:
         labels_root=args.labels_root,
         data_yaml=args.data_yaml,
         mode=args.mode,
+        label_policy=args.label_policy,
     )
     print(
         "done "
@@ -38,6 +40,7 @@ def main() -> int:
         f"kept_images={summary['kept_images']:,} "
         f"drop_image_candidates={summary['drop_image_candidates']:,} "
         f"drop_record_candidates={summary['drop_record_candidates']:,} "
+        f"label_policy={summary['effective_label_policy']} "
         f"output={summary['output_dir']}",
         flush=True,
     )

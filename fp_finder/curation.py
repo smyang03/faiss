@@ -969,15 +969,25 @@ def export_similarity_reduction_plan(
     labels_root: str = "",
     data_yaml: str = "",
     mode: str = "manifest",
+    label_policy: str = "filtered",
 ) -> Dict:
     plan_root = Path(plan_dir)
     image_plan_path = plan_root / "reduction_image_plan.csv"
     if not image_plan_path.exists():
         raise FileNotFoundError(f"Missing reduction_image_plan.csv in {plan_root}")
+    keep_records_path = plan_root / "reduction_keep_records.csv"
+    drop_records_path = plan_root / "reduction_drop_records.csv"
 
     output = Path(output_dir)
     output.mkdir(parents=True, exist_ok=True)
     image_plan = pd.read_csv(image_plan_path)
+    summary_path = plan_root / "reduction_summary.json"
+    plan_summary = {}
+    if summary_path.exists():
+        with summary_path.open("r", encoding="utf-8") as f:
+            plan_summary = json.load(f) or {}
+    partial_plan = bool(plan_summary.get("partial_plan", False))
+
     drop_mask = image_plan["image_action"].astype(str).str.startswith("DROP")
     if "drop_safety" in image_plan.columns:
         drop_mask = drop_mask & (image_plan["drop_safety"].astype(str) != "SAMPLE_ONLY_DO_NOT_DELETE")
@@ -989,10 +999,23 @@ def export_similarity_reduction_plan(
     (output / "keep_images.txt").write_text("\n".join(keep_images) + ("\n" if keep_images else ""), encoding="utf-8")
     (output / "keep_labels.txt").write_text("\n".join(keep_labels) + ("\n" if keep_labels else ""), encoding="utf-8")
     drop_df.to_csv(output / "drop_image_candidates.csv", index=False, encoding="utf-8-sig")
+    if keep_records_path.exists():
+        shutil.copy2(keep_records_path, output / "kept_records.csv")
+    if drop_records_path.exists():
+        shutil.copy2(drop_records_path, output / "dropped_records.csv")
 
     copied_images = 0
     copied_labels = 0
+    kept_record_count = 0
+    filtered_label_lines = 0
     mode = str(mode or "manifest").lower()
+    label_policy = str(label_policy or "filtered").lower()
+    if label_policy not in {"filtered", "original"}:
+        label_policy = "filtered"
+    effective_label_policy = label_policy
+    if partial_plan and label_policy == "filtered":
+        effective_label_policy = "original_partial_plan"
+
     if mode in {"copy", "hardlink"}:
         img_root = Path(images_root) if images_root else None
         lbl_root = Path(labels_root) if labels_root else None
@@ -1014,19 +1037,61 @@ def export_similarity_reduction_plan(
                 else:
                     shutil.copy2(image_path, target)
                 copied_images += 1
-            if label_path.exists():
+
+        if effective_label_policy == "filtered" and keep_records_path.exists():
+            keep_records = pd.read_csv(keep_records_path)
+            keep_records = keep_records[keep_records["image_path"].astype(str).isin(set(keep_df["image_path"].astype(str).tolist()))].copy()
+            kept_record_count = int(len(keep_records))
+            label_plan_rows = []
+            for label_path_text, group in keep_records.groupby("label_path"):
+                label_path = Path(str(label_path_text))
+                if not label_path.exists():
+                    continue
+                try:
+                    lines = label_path.read_text(encoding="utf-8", errors="replace").splitlines()
+                except Exception:
+                    continue
+                keep_line_numbers = sorted(
+                    {
+                        int(float(value))
+                        for value in group["annotation_line"].dropna().tolist()
+                        if str(value).strip() != ""
+                    }
+                )
+                filtered_lines = [lines[idx] for idx in keep_line_numbers if 0 <= idx < len(lines)]
+                if not filtered_lines:
+                    continue
                 rel = _safe_relative(label_path, lbl_root, "external_labels")
                 target = label_out_root / rel
                 target.parent.mkdir(parents=True, exist_ok=True)
-                if mode == "hardlink":
-                    try:
-                        if not target.exists():
-                            target.hardlink_to(label_path)
-                    except Exception:
-                        shutil.copy2(label_path, target)
-                else:
-                    shutil.copy2(label_path, target)
+                target.write_text("\n".join(filtered_lines) + "\n", encoding="utf-8")
                 copied_labels += 1
+                filtered_label_lines += int(len(filtered_lines))
+                label_plan_rows.append(
+                    {
+                        "source_label_path": str(label_path),
+                        "target_label_path": str(target),
+                        "kept_annotations": int(len(filtered_lines)),
+                        "source_annotations": int(len(lines)),
+                    }
+                )
+            pd.DataFrame(label_plan_rows).to_csv(output / "filtered_label_plan.csv", index=False, encoding="utf-8-sig")
+        else:
+            for row in keep_df.itertuples(index=False):
+                label_path = Path(str(row.label_path))
+                if label_path.exists():
+                    rel = _safe_relative(label_path, lbl_root, "external_labels")
+                    target = label_out_root / rel
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    if mode == "hardlink":
+                        try:
+                            if not target.exists():
+                                target.hardlink_to(label_path)
+                        except Exception:
+                            shutil.copy2(label_path, target)
+                    else:
+                        shutil.copy2(label_path, target)
+                    copied_labels += 1
 
     if data_yaml:
         source_yaml = Path(data_yaml)
@@ -1042,23 +1107,21 @@ def export_similarity_reduction_plan(
             with (output / "reduction_data.yaml").open("w", encoding="utf-8") as f:
                 yaml.safe_dump(reduced_yaml, f, allow_unicode=True, sort_keys=False)
 
-    summary_path = plan_root / "reduction_summary.json"
-    plan_summary = {}
-    if summary_path.exists():
-        with summary_path.open("r", encoding="utf-8") as f:
-            plan_summary = json.load(f) or {}
-
     summary = {
         "plan_dir": str(plan_root),
         "output_dir": str(output),
         "mode": mode,
+        "label_policy": label_policy,
+        "effective_label_policy": effective_label_policy,
         "kept_images": int(len(keep_df)),
         "drop_image_candidates": int(len(drop_df)),
         "copied_images": int(copied_images),
         "copied_labels": int(copied_labels),
+        "kept_record_annotations": int(kept_record_count),
+        "filtered_label_lines": int(filtered_label_lines),
         "drop_record_candidates": int(plan_summary.get("drop_record_candidates", 0) or 0),
         "record_reduction_pct_of_planned": float(plan_summary.get("record_reduction_pct_of_planned", 0.0) or 0.0),
-        "partial_plan": bool(plan_summary.get("partial_plan", False)),
+        "partial_plan": bool(partial_plan),
     }
     with (output / "similarity_reduction_export_summary.json").open("w", encoding="utf-8") as f:
         json.dump(summary, f, ensure_ascii=False, indent=2)
