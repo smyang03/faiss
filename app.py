@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import html
 import io
+import json
 import os
 import re
 import subprocess
@@ -41,11 +42,19 @@ from fp_finder.projects import (
     slugify,
     upsert_project,
 )
+from fp_finder.curation import (
+    CurationReportConfig,
+    build_curation_report,
+    export_reduced_dataset,
+)
 from fp_finder.feature_clustering import (
     SIZE_BUCKET_LABELS,
     SIZE_BUCKET_ORDER,
     build_feature_clusters,
+    class_id_filter_value,
     load_cluster_metadata,
+    load_or_build_record_meta_arrays,
+    sample_filtered_indices_fast,
     size_bucket_from_area_ratio,
 )
 from fp_finder.video import collect_video_detections, read_video_frame
@@ -1090,7 +1099,55 @@ def render_db_neighbor_results(render_key_prefix: str = "db_neighbor") -> None:
 
 @st.cache_data(show_spinner=False)
 def cached_cluster_metadata(index_dir: str) -> Dict:
-    return load_cluster_metadata(index_dir)
+    root = Path(index_dir)
+    metadata = {
+        "total_records": 0,
+        "class_counts": {},
+        "size_counts": {key: 0 for key in SIZE_BUCKET_ORDER},
+        "size_bucket_order": SIZE_BUCKET_ORDER,
+        "size_bucket_labels": SIZE_BUCKET_LABELS,
+        "metadata_ready": False,
+    }
+    config_path = root / "config.json"
+    if config_path.exists():
+        try:
+            with config_path.open("r", encoding="utf-8") as f:
+                config = json.load(f) or {}
+            metadata["total_records"] = int(config.get("num_records", 0) or 0)
+        except Exception:
+            pass
+
+    cache_path = root / "record_meta_cache.npz"
+    if not cache_path.exists() or int(metadata["total_records"]) <= 0:
+        return metadata
+
+    try:
+        with np.load(str(cache_path), allow_pickle=False) as data:
+            total = int(metadata["total_records"])
+            class_ids = np.asarray(data["class_ids"][:total], dtype=np.int32)
+            size_codes = np.asarray(data["size_codes"][:total], dtype=np.int16)
+        class_values, class_counts = np.unique(class_ids, return_counts=True)
+        size_values, size_counts = np.unique(size_codes, return_counts=True)
+        metadata["class_counts"] = {
+            str(int(class_id)): int(count)
+            for class_id, count in zip(class_values.tolist(), class_counts.tolist())
+            if int(class_id) >= 0
+        }
+        metadata["size_counts"] = {key: 0 for key in SIZE_BUCKET_ORDER}
+        for size_code, count in zip(size_values.tolist(), size_counts.tolist()):
+            bucket = SIZE_BUCKET_ORDER[int(size_code)] if 0 <= int(size_code) < len(SIZE_BUCKET_ORDER) else ""
+            if bucket:
+                metadata["size_counts"][bucket] = int(count)
+        metadata["metadata_ready"] = True
+    except Exception:
+        metadata["metadata_ready"] = False
+    return metadata
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def cached_discover_nested_pairs(dataset_root: str) -> List[Dict[str, str]]:
+    pairs = discover_nested_image_label_pairs(dataset_root)
+    return [{"image_dir": str(image_root), "labels": str(label_root)} for image_root, label_root in pairs]
 
 
 @st.cache_resource(show_spinner=False)
@@ -1107,6 +1164,7 @@ def cached_feature_clusters(
     class_filter: str,
     size_bucket: str,
     clustering_scope: str,
+    clustering_method: str,
 ) -> Dict:
     return build_feature_clusters(
         index_dir=index_dir,
@@ -1116,6 +1174,7 @@ def cached_feature_clusters(
         class_filter=class_filter or None,
         size_bucket=size_bucket or None,
         clustering_scope=clustering_scope,
+        clustering_method=clustering_method,
     )
 
 
@@ -1145,23 +1204,44 @@ def cached_similarity_calibration(
         return {"detail": pd.DataFrame(), "bins": pd.DataFrame(), "thresholds": pd.DataFrame(), "classes": pd.DataFrame()}
 
     class_filter = str(class_filter or "").strip()
-    candidates = []
-    for idx in range(total):
-        record = records[idx]
-        class_key = f"{record.class_id}: {record.class_name}"
-        if class_filter and class_filter != "All" and class_filter not in {str(record.class_name), class_key, str(record.class_id)}:
-            continue
-        candidates.append(idx)
-    if not candidates:
-        return {"detail": pd.DataFrame(), "bins": pd.DataFrame(), "thresholds": pd.DataFrame(), "classes": pd.DataFrame()}
-
     rng = np.random.default_rng(int(seed))
-    candidates_arr = np.asarray(candidates, dtype=np.int64)
-    actual_sample = min(int(sample_size), int(candidates_arr.size))
-    if actual_sample < candidates_arr.size:
-        sample_indices = np.sort(rng.choice(candidates_arr, size=actual_sample, replace=False))
+
+    if not class_filter or class_filter == "All":
+        candidate_mode = "full_index_random_sample"
+        candidates_arr = np.arange(total, dtype=np.int64)
+        total_candidates = int(candidates_arr.size)
+        actual_sample = min(int(sample_size), int(candidates_arr.size))
+        if actual_sample < candidates_arr.size:
+            sample_indices = np.sort(rng.choice(candidates_arr, size=actual_sample, replace=False))
+        else:
+            sample_indices = candidates_arr
     else:
-        sample_indices = candidates_arr
+        candidate_mode = "fast_filtered_sample"
+        total_candidates = 0
+        sample_indices = sample_filtered_indices_fast(
+            records,
+            total=total,
+            max_points=int(sample_size),
+            seed=int(seed),
+            class_filter=class_filter,
+            size_bucket="",
+        )
+        if int(sample_indices.size) < min(int(sample_size), int(total)):
+            class_id_value = class_id_filter_value(class_filter)
+            if class_id_value is not None:
+                class_ids, _size_codes = load_or_build_record_meta_arrays(index_dir, records, total)
+                candidates_arr = np.flatnonzero(class_ids[:total] == int(class_id_value)).astype(np.int64)
+                candidate_mode = "exact_cached_filter"
+                total_candidates = int(candidates_arr.size)
+                actual_sample = min(int(sample_size), int(candidates_arr.size))
+                if actual_sample < candidates_arr.size:
+                    sample_indices = np.sort(rng.choice(candidates_arr, size=actual_sample, replace=False))
+                else:
+                    sample_indices = candidates_arr
+        else:
+            total_candidates = int(sample_indices.size)
+        if int(sample_indices.size) == 0:
+            return {"detail": pd.DataFrame(), "bins": pd.DataFrame(), "thresholds": pd.DataFrame(), "classes": pd.DataFrame()}
 
     index = faiss.read_index(str(index_path))
     search_k = min(int(top_k) + 1, total)
@@ -1289,7 +1369,8 @@ def cached_similarity_calibration(
         "thresholds": thresholds_df,
         "classes": classes,
         "sample_size": int(len(detail)),
-        "total_candidates": int(candidates_arr.size),
+        "total_candidates": int(total_candidates),
+        "candidate_mode": candidate_mode,
     }
 
 
@@ -1415,79 +1496,114 @@ def cluster_hover_text(row: pd.Series) -> str:
         f"record={int(row.record_id)}<br>"
         f"class={int(row.class_id)} {html.escape(str(row.class_name))}<br>"
         f"cluster={html.escape(str(row.cluster_label))}<br>"
-        f"size={html.escape(str(row.size_bucket))} area={float(row.area_pct):.2f}%<br>"
-        f"{html.escape(str(row.file_name))}"
+        f"size={html.escape(str(row.size_bucket))} area={float(row.area_pct):.2f}%"
     )
 
 
-def build_cluster_3d_hover_figure(df: pd.DataFrame, color_by: str, seed: int, max_points: int = 5000) -> go.Figure:
+def build_cluster_hover_figure(
+    df: pd.DataFrame,
+    color_by: str,
+    seed: int,
+    projection: str = "3D",
+    max_points: int = 1500,
+) -> go.Figure:
     if len(df) > max_points:
         plot_df = df.sample(n=max_points, random_state=int(seed)).copy()
     else:
         plot_df = df.copy()
 
     fig = go.Figure()
+    projection = str(projection or "3D").upper()
+    is_3d = projection == "3D"
     color_by = str(color_by or "cluster_label")
     if color_by == "area_ratio":
+        scatter_kwargs = dict(
+            x=[float(value) for value in plot_df["x"].tolist()],
+            y=[float(value) for value in plot_df["y"].tolist()],
+            mode="markers",
+            name="area_ratio",
+            customdata=[int(value) for value in plot_df["record_idx"].tolist()],
+            text=[cluster_hover_text(row) for _, row in plot_df.iterrows()],
+            hovertemplate="%{text}<extra></extra>",
+            marker=dict(
+                size=9,
+                opacity=0.82,
+                color=[float(value) for value in plot_df["area_ratio"].tolist()],
+                colorscale="Viridis",
+                showscale=True,
+                colorbar=dict(title="area"),
+            ),
+        )
+        if is_3d:
+            scatter_kwargs["z"] = [float(value) for value in plot_df["z"].tolist()]
+            scatter_cls = go.Scatter3d
+        else:
+            scatter_cls = go.Scatter
         fig.add_trace(
-            go.Scatter3d(
-                x=[float(value) for value in plot_df["x"].tolist()],
-                y=[float(value) for value in plot_df["y"].tolist()],
-                z=[float(value) for value in plot_df["z"].tolist()],
-                mode="markers",
-                name="area_ratio",
-                customdata=[int(value) for value in plot_df["record_idx"].tolist()],
-                text=[cluster_hover_text(row) for _, row in plot_df.iterrows()],
-                hovertemplate="%{text}<extra></extra>",
-                marker=dict(
-                    size=9,
-                    opacity=0.82,
-                    color=[float(value) for value in plot_df["area_ratio"].tolist()],
-                    colorscale="Viridis",
-                    showscale=True,
-                    colorbar=dict(title="area"),
-                ),
-            )
+            scatter_cls(**scatter_kwargs)
         )
     else:
         plot_df["_cluster_color"] = plot_df[color_by].astype(str)
         groups = sorted(plot_df["_cluster_color"].unique().tolist())
-        for group_index, group_name in enumerate(groups):
-            group = plot_df[plot_df["_cluster_color"] == group_name]
-            fig.add_trace(
-                go.Scatter3d(
-                    x=[float(value) for value in group["x"].tolist()],
-                    y=[float(value) for value in group["y"].tolist()],
-                    z=[float(value) for value in group["z"].tolist()],
-                    mode="markers",
-                    name=str(group_name),
-                    customdata=[int(value) for value in group["record_idx"].tolist()],
-                    text=[cluster_hover_text(row) for _, row in group.iterrows()],
-                    hovertemplate="%{text}<extra></extra>",
-                    marker=dict(
-                        size=7,
-                        opacity=0.84,
-                        color=CLICK_MAP_PALETTE[group_index % len(CLICK_MAP_PALETTE)],
-                    ),
+        color_map = {
+            group_name: CLICK_MAP_PALETTE[group_index % len(CLICK_MAP_PALETTE)]
+            for group_index, group_name in enumerate(groups)
+        }
+        scatter_kwargs = dict(
+            x=[float(value) for value in plot_df["x"].tolist()],
+            y=[float(value) for value in plot_df["y"].tolist()],
+            mode="markers",
+            name=str(color_by),
+            customdata=[int(value) for value in plot_df["record_idx"].tolist()],
+            text=[cluster_hover_text(row) for _, row in plot_df.iterrows()],
+            hovertemplate="%{text}<extra></extra>",
+            marker=dict(
+                size=7,
+                opacity=0.84,
+                color=[color_map[str(value)] for value in plot_df["_cluster_color"].tolist()],
+            ),
+        )
+        if is_3d:
+            scatter_kwargs["z"] = [float(value) for value in plot_df["z"].tolist()]
+            scatter_cls = go.Scatter3d
+        else:
+            scatter_cls = go.Scatter
+        fig.add_trace(scatter_cls(**scatter_kwargs))
+        if len(groups) <= 20:
+            for group_name in groups:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[None],
+                        y=[None],
+                        mode="markers",
+                        name=str(group_name),
+                        marker=dict(size=7, color=color_map[str(group_name)]),
+                        hoverinfo="skip",
+                        showlegend=True,
+                    )
                 )
-            )
 
-    fig.update_layout(
+    layout = dict(
         margin=dict(l=0, r=0, t=20, b=0),
         clickmode="event+select",
-        dragmode="turntable",
-        height=720,
+        dragmode="turntable" if is_3d else "pan",
+        height=720 if is_3d else 660,
         paper_bgcolor="#07111f",
         plot_bgcolor="#07111f",
         font=dict(color="#dbeafe"),
         legend=dict(bgcolor="rgba(7, 17, 31, 0.78)", font=dict(color="#dbeafe")),
-        scene=dict(
+    )
+    if is_3d:
+        layout["scene"] = dict(
             bgcolor="#07111f",
             xaxis=dict(backgroundcolor="#07111f", gridcolor="#1d3a57", zerolinecolor="#2b5c86", color="#dbeafe"),
             yaxis=dict(backgroundcolor="#07111f", gridcolor="#1d3a57", zerolinecolor="#2b5c86", color="#dbeafe"),
             zaxis=dict(backgroundcolor="#07111f", gridcolor="#1d3a57", zerolinecolor="#2b5c86", color="#dbeafe"),
-        ),
-    )
+        )
+    else:
+        layout["xaxis"] = dict(title="PCA x", gridcolor="#1d3a57", zerolinecolor="#2b5c86", color="#dbeafe")
+        layout["yaxis"] = dict(title="PCA y", gridcolor="#1d3a57", zerolinecolor="#2b5c86", color="#dbeafe")
+    fig.update_layout(**layout)
     return fig
 
 
@@ -1642,10 +1758,11 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
         return
 
     metadata = cached_cluster_metadata(feature_index_dir)
-    class_options = ["All"] + sorted(metadata.get("class_counts", {}).keys())
+    class_counts = metadata.get("class_counts", {}) or {}
+    class_options = ["All"] + sorted(class_counts.keys(), key=lambda value: int(value) if str(value).isdigit() else str(value))
     size_options = ["All"] + list(SIZE_BUCKET_ORDER)
 
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     with col1:
         max_points = st.number_input(
             "Sample points",
@@ -1677,10 +1794,31 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
             }[value],
             key="cluster_scope",
         )
+    with col5:
+        clustering_method = st.selectbox(
+            "Cluster method",
+            ["minibatch_kmeans", "bisecting_kmeans", "birch", "hdbscan"],
+            format_func=lambda value: {
+                "minibatch_kmeans": "MiniBatchKMeans",
+                "bisecting_kmeans": "BisectingKMeans",
+                "birch": "BIRCH",
+                "hdbscan": "HDBSCAN",
+            }[value],
+            key="cluster_method",
+            help="HDBSCAN is best used on smaller samples or per-class filters.",
+        )
 
     filter_col1, filter_col2, filter_col3 = st.columns(3)
     with filter_col1:
-        class_filter = st.selectbox("Class filter", class_options, index=0, key="cluster_class_filter")
+        if class_counts:
+            class_filter = st.selectbox("Class filter", class_options, index=0, key="cluster_class_filter")
+        else:
+            class_filter = st.text_input(
+                "Class filter",
+                value="",
+                placeholder="All / class id, e.g. 0",
+                key="cluster_class_filter_text",
+            )
     with filter_col2:
         size_filter = st.selectbox(
             "Size filter",
@@ -1691,7 +1829,7 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
         )
     with filter_col3:
         color_by = st.selectbox(
-            "3D color",
+            "Graph color",
             ["cluster_label", "class_name", "size_bucket", "area_ratio"],
             format_func=lambda value: {
                 "cluster_label": "Cluster",
@@ -1703,14 +1841,16 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
         )
 
     if st.button("Run clustering", type="primary", key="btn_run_feature_clustering"):
+        normalized_class_filter = "" if str(class_filter).strip() in {"", "All"} else str(class_filter).strip()
         next_request = {
             "index_dir": feature_index_dir,
             "max_points": int(max_points),
             "n_clusters": int(n_clusters),
             "seed": int(seed),
-            "class_filter": "" if class_filter == "All" else class_filter,
+            "class_filter": normalized_class_filter,
             "size_bucket": "" if size_filter == "All" else size_filter,
             "clustering_scope": clustering_scope,
+            "clustering_method": clustering_method,
             "color_by": color_by,
         }
         st.session_state["cluster_request"] = next_request
@@ -1726,6 +1866,28 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
             f"Index records={metadata.get('total_records', 0):,}. "
             "Run clustering to check class/size mixing in YOLO feature space."
         )
+        if not metadata.get("metadata_ready"):
+            st.info(
+                "Class/size count metadata is not built yet. The page avoids scanning all records on load; "
+                "class filters still work by entering a class id, or build the metadata cache below."
+            )
+            if st.button("Build Class/Size Metadata", key="btn_build_cluster_metadata", use_container_width=True):
+                records = open_record_store(feature_index_dir)
+                total = len(records)
+                progress_bar = st.progress(0.0)
+                status = st.empty()
+                start = time.time()
+
+                def progress(done: int, total_count: int, message: str) -> None:
+                    progress_bar.progress(0.0 if total_count <= 0 else min(1.0, done / max(1, total_count)))
+                    status.caption(progress_with_eta(int(done), int(total_count), message, start))
+
+                load_or_build_record_meta_arrays(feature_index_dir, records, total, progress=progress)
+                cached_cluster_metadata.clear()
+                progress_bar.progress(1.0)
+                status.success(f"Class/size metadata ready in {format_duration(time.time() - start)}")
+                st.rerun()
+            return
         class_count_df = pd.DataFrame(
             [{"class": key, "count": value} for key, value in metadata.get("class_counts", {}).items()]
         ).sort_values("count", ascending=False)
@@ -1746,16 +1908,27 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
     result_request = st.session_state.get("cluster_result_request")
     if result is None or result_request != request:
         start = time.time()
-        with st.spinner("Building 3D feature clusters..."):
-            result = cached_feature_clusters(
-                request["index_dir"],
-                int(request["max_points"]),
-                int(request["n_clusters"]),
-                int(request["seed"]),
-                str(request.get("class_filter", "")),
-                str(request.get("size_bucket", "")),
-                str(request.get("clustering_scope", "global")),
+        progress_bar = st.progress(0.0)
+        progress_status = st.empty()
+
+        def cluster_progress(done: int, total: int, message: str) -> None:
+            progress_bar.progress(0.0 if total <= 0 else min(1.0, float(done) / max(1, float(total))))
+            progress_status.caption(progress_with_eta(int(done), int(total), message, start))
+
+        with st.spinner("Building feature clusters..."):
+            result = build_feature_clusters(
+                index_dir=request["index_dir"],
+                max_points=int(request["max_points"]),
+                n_clusters=int(request["n_clusters"]),
+                seed=int(request["seed"]),
+                class_filter=str(request.get("class_filter", "")) or None,
+                size_bucket=str(request.get("size_bucket", "")) or None,
+                clustering_scope=str(request.get("clustering_scope", "global")),
+                clustering_method=str(request.get("clustering_method", "minibatch_kmeans")),
+                progress=cluster_progress,
             )
+        progress_bar.progress(1.0)
+        progress_status.success(f"Clustering complete in {format_duration(time.time() - start)}")
         st.session_state["cluster_result"] = result
         st.session_state["cluster_result_request"] = dict(request)
         st.session_state["cluster_result_elapsed"] = time.time() - start
@@ -1779,12 +1952,13 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
         f"sample={result['sample_size']:,}/{result['total_records']:,} | "
         f"clusters={result['n_clusters']} | "
         f"scope={request.get('clustering_scope', 'global')} | "
+        f"method={request.get('clustering_method', 'minibatch_kmeans')} | "
         f"PCA explained={sum(result['explained_variance_ratio']) * 100:.1f}% | "
         f"elapsed={format_duration(result_elapsed)}"
     )
 
     st.subheader("Cluster Display")
-    display_col1, display_col2, display_col3, display_col4 = st.columns(4)
+    display_col1, display_col2, display_col3, display_col4, display_col5, display_col6 = st.columns(6)
     display_class_options = ["All"] + sorted(df["class_name"].astype(str).unique().tolist())
     display_group_options = ["All"] + sorted(df["cluster_label"].astype(str).unique().tolist())
     with display_col1:
@@ -1817,6 +1991,23 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
             index=0,
             key="cluster_display_group",
             disabled=close_overlap_only,
+        )
+    with display_col5:
+        graph_projection = st.selectbox(
+            "Graph view",
+            ["3D", "2D"],
+            index=0,
+            key="cluster_graph_projection",
+        )
+    with display_col6:
+        graph_points = st.number_input(
+            "Graph points",
+            min_value=200,
+            max_value=5000,
+            value=1500,
+            step=100,
+            key="cluster_graph_points",
+            help="Limits points sent to the browser. The analysis sample remains unchanged.",
         )
 
     overlap_pairs = pd.DataFrame()
@@ -1860,47 +2051,55 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
 
     graph_col, preview_col = st.columns([3, 1])
     with graph_col:
-        st.subheader("3D Cluster View")
+        st.subheader(f"{graph_projection} Cluster View")
         enable_hover_preview = st.checkbox(
             "Hover preview",
             value=False,
             key="cluster_enable_hover_preview",
         )
+        hover_allowed = bool(enable_hover_preview) and int(graph_points) <= 1000
+        if enable_hover_preview and not hover_allowed:
+            st.warning("Hover preview is disabled above 1,000 graph points to avoid browser memory errors.")
         st.caption("Click a point to preview/compare. Enable hover preview only when needed.")
-        selected_points_3d = []
+        selected_points_graph = []
         plot_color_by = "class_name" if close_overlap_only else str(request.get("color_by", "cluster_label"))
-        fig = build_cluster_3d_hover_figure(
+        fig = build_cluster_hover_figure(
             display_df,
             color_by=plot_color_by,
             seed=int(request["seed"]),
+            projection=str(graph_projection),
+            max_points=int(graph_points),
         )
+        graph_height = 720 if graph_projection == "3D" else 660
+        graph_key_suffix = f"{graph_projection.lower()}_{int(graph_points)}_{'hover' if hover_allowed else 'click'}"
         if plotly_events is not None:
-            selected_points_3d = plotly_events(
+            selected_points_graph = plotly_events(
                 fig,
                 click_event=True,
                 select_event=False,
-                hover_event=bool(enable_hover_preview),
-                override_height=720,
+                hover_event=bool(hover_allowed),
+                override_height=graph_height,
                 override_width="100%",
-                key=f"cluster_3d_events_{'hover' if enable_hover_preview else 'click'}",
+                key=f"cluster_graph_events_{graph_key_suffix}",
             )
         else:
-            plot_state_3d = st.plotly_chart(
+            plot_state_graph = st.plotly_chart(
                 fig,
                 use_container_width=True,
-                key="cluster_3d_plot",
+                key=f"cluster_{graph_projection.lower()}_plot",
                 on_select="rerun",
                 selection_mode="points",
                 theme=None,
             )
+            selected_points_graph = plotly_state_selected_points(plot_state_graph)
 
     selected_event = None
     selected_fig = None
     selected_source = ""
-    if selected_points_3d:
-        selected_event = selected_points_3d[0]
+    if selected_points_graph:
+        selected_event = selected_points_graph[0]
         selected_fig = fig
-        selected_source = "3D"
+        selected_source = str(graph_projection)
 
     if selected_event is not None and selected_fig is not None:
         raw_custom = event_custom_data_from_plotly_event(selected_event, selected_fig)
@@ -1912,7 +2111,7 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
             st.session_state["cluster_graph_event_status"] = (
                 f"selected record={custom[0]} | {custom[5]} | {custom[13]} | {selected_source}"
             )
-            if not enable_hover_preview:
+            if not hover_allowed:
                 add_cluster_compare_point(custom)
         else:
             st.session_state["cluster_graph_event_status"] = "point event received, but custom data was empty"
@@ -1981,7 +2180,7 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
                 st.rerun()
         selected = st.session_state.get("cluster_graph_selected")
         if not selected:
-            st.caption("Click a point in the 3D graph, or use Manual preview.")
+            st.caption("Click a point in the graph, or use Manual preview.")
         else:
             try:
                 record = crop_record_from_cluster_custom(selected)
@@ -2010,10 +2209,15 @@ def feature_cluster_tab(project: Dict, config: Dict) -> None:
             if left_row is not None and right_row is not None:
                 left_xyz = left_row[["x", "y", "z"]].to_numpy(dtype=np.float32)
                 right_xyz = right_row[["x", "y", "z"]].to_numpy(dtype=np.float32)
+                left_xy = left_row[["x", "y"]].to_numpy(dtype=np.float32)
+                right_xy = right_row[["x", "y"]].to_numpy(dtype=np.float32)
+                distance_2d = float(np.linalg.norm(left_xy - right_xy))
                 distance_3d = float(np.linalg.norm(left_xyz - right_xyz))
+                display_distance = distance_2d if graph_projection == "2D" else distance_3d
                 same_class = str(left_row.class_name) == str(right_row.class_name)
                 st.caption(
-                    f"same_class={same_class} | 3D PCA distance={distance_3d:.5f} | "
+                    f"same_class={same_class} | {graph_projection} PCA distance={display_distance:.5f} | "
+                    f"2D={distance_2d:.5f} | 3D={distance_3d:.5f} | "
                     f"left={int(left_row.class_id)} {left_row.class_name} | "
                     f"right={int(right_row.class_id)} {right_row.class_name}"
                 )
@@ -2542,7 +2746,7 @@ def path_check_row(item: str, path_text: str, required: bool = True, kind: str =
     return {"item": item, "status": status, "kind": kind, "detail": detail}
 
 
-def project_preflight_rows(project: Dict) -> List[Dict]:
+def project_preflight_rows(project: Dict, scan_nested: bool = False) -> List[Dict]:
     project = normalize_project(project)
     rows: List[Dict] = []
     layout = str(project.get("dataset_layout", DATASET_LAYOUT_SINGLE))
@@ -2551,15 +2755,25 @@ def project_preflight_rows(project: Dict) -> List[Dict]:
     if layout == DATASET_LAYOUT_SINGLE:
         rows.append(path_check_row("labels_dir", project.get("labels_dir", ""), required=True, kind="input"))
     else:
-        pairs = discover_nested_image_label_pairs(project.get("images_dir", ""))
-        rows.append(
-            {
-                "item": "nested image/label pairs",
-                "status": "OK" if pairs else "FAIL",
-                "kind": "input",
-                "detail": f"{len(pairs):,} pairs found (*.JPEGImages|images + labels)",
-            }
-        )
+        if scan_nested:
+            pairs = discover_nested_image_label_pairs(project.get("images_dir", ""))
+            rows.append(
+                {
+                    "item": "nested image/label pairs",
+                    "status": "OK" if pairs else "FAIL",
+                    "kind": "input",
+                    "detail": f"{len(pairs):,} pairs found (*.JPEGImages|images + labels)",
+                }
+            )
+        else:
+            rows.append(
+                {
+                    "item": "nested image/label pairs",
+                    "status": "WARN",
+                    "kind": "input",
+                    "detail": "not scanned on page load; use Check Nested Pairs or Start Feature Build",
+                }
+            )
     rows.append(path_check_row("data_yaml", project.get("data_yaml", ""), required=True, kind="input"))
     rows.append(path_check_row("weights_path", project.get("weights_path", ""), required=True, kind="model"))
     rows.append(path_check_row("repo_path", project.get("repo_path", ""), required=True, kind="model"))
@@ -2586,8 +2800,8 @@ def project_preflight_rows(project: Dict) -> List[Dict]:
     return rows
 
 
-def project_preflight_errors(project: Dict) -> List[str]:
-    rows = project_preflight_rows(project)
+def project_preflight_errors(project: Dict, scan_nested: bool = True) -> List[str]:
+    rows = project_preflight_rows(project, scan_nested=scan_nested)
     return [f"{row['item']}: {row['detail']}" for row in rows if row.get("status") == "FAIL"]
 
 
@@ -2894,7 +3108,7 @@ def project_build_status(project: Dict) -> None:
     log_root = summary["log_root"]
     st.caption(f"Build log: {log_root}")
 
-    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
     with metric_col1:
         st.metric("Stage", summary["stage"])
     with metric_col2:
@@ -3103,24 +3317,24 @@ def project_manager_tab(config: Dict) -> None:
     )
 
     if project.get("dataset_layout") == DATASET_LAYOUT_NESTED_IMAGE_LABELS:
-        pairs = discover_nested_image_label_pairs(project["images_dir"])
-        if pairs:
-            st.caption(f"Nested layout detected pairs: {len(pairs):,}")
+        st.caption("Nested layout selected. Folder pair discovery can be slow on network drives, so it runs only on request.")
+        pair_state_key = f"nested_pairs_{slugify(str(project.get('name', 'project')))}"
+        if st.button("Check Nested Pairs", key=f"btn_check_nested_pairs_{slugify(str(project.get('name', 'project')))}"):
+            with st.spinner("Scanning nested image/label folders..."):
+                st.session_state[pair_state_key] = cached_discover_nested_pairs(project["images_dir"])
+        pair_rows = st.session_state.get(pair_state_key, [])
+        if pair_rows:
+            st.caption(f"Nested layout detected pairs: {len(pair_rows):,}")
             with st.expander("Detected image/label pairs", expanded=False):
                 st.dataframe(
-                    pd.DataFrame(
-                        [
-                            {"image_dir": str(image_root), "labels": str(label_root)}
-                            for image_root, label_root in pairs[:500]
-                        ]
-                    ),
+                    pd.DataFrame(pair_rows[:500]),
                     use_container_width=True,
                     hide_index=True,
                 )
-                if len(pairs) > 500:
-                    st.caption(f"Showing first 500 of {len(pairs):,} pairs.")
+                if len(pair_rows) > 500:
+                    st.caption(f"Showing first 500 of {len(pair_rows):,} pairs.")
         else:
-            st.warning("Nested layout selected, but no */JPEGImages or */images + sibling */labels pairs were found.")
+            st.info("Nested pairs are not scanned yet on this page. Use Check Nested Pairs when you need validation.")
 
     if project.get("script_text"):
         st.download_button(
@@ -3217,7 +3431,8 @@ def project_manager_tab(config: Dict) -> None:
     start_build = st.button("Start Feature Build", type="primary", key="btn_start_project_feature_build")
     if start_build:
         errors = project_required_errors(project)
-        errors.extend(project_preflight_errors(project))
+        with st.spinner("Checking project readiness..."):
+            errors.extend(project_preflight_errors(project, scan_nested=True))
         if errors:
             st.error("; ".join(errors))
         else:
@@ -3720,7 +3935,8 @@ def calibration_tab(project: Dict, config: Dict) -> None:
 
     metadata = cached_cluster_metadata(feature_index_dir)
     total_records = int(metadata.get("total_records", 0) or 0)
-    class_options = ["All"] + sorted(metadata.get("class_counts", {}).keys())
+    class_counts = metadata.get("class_counts", {}) or {}
+    class_options = ["All"] + sorted(class_counts.keys(), key=lambda value: int(value) if str(value).isdigit() else str(value))
     st.caption(
         "DB leave-one-out evidence. Each sampled DB bbox searches the same DB while excluding itself. "
         "The rates below are empirical same-class support, not direct YOLO detection probability."
@@ -3749,15 +3965,24 @@ def calibration_tab(project: Dict, config: Dict) -> None:
             key="calibration_bin_width",
         )
     with col5:
-        class_filter = st.selectbox("Class", class_options, index=0, key="calibration_class_filter")
+        if class_counts:
+            class_filter = st.selectbox("Class", class_options, index=0, key="calibration_class_filter")
+        else:
+            class_filter = st.text_input(
+                "Class",
+                value="",
+                placeholder="All / class id, e.g. 0",
+                key="calibration_class_filter_text",
+            )
 
     if st.button("Run Calibration", type="primary", key="btn_run_similarity_calibration"):
+        normalized_class_filter = "" if str(class_filter).strip() in {"", "All"} else str(class_filter).strip()
         next_request = {
             "index_dir": feature_index_dir,
             "sample_size": int(sample_size),
             "top_k": int(top_k),
             "seed": int(seed),
-            "class_filter": str(class_filter),
+            "class_filter": normalized_class_filter,
             "bin_width": float(bin_width),
         }
         st.session_state["calibration_request"] = next_request
@@ -3792,15 +4017,17 @@ def calibration_tab(project: Dict, config: Dict) -> None:
         return
 
     elapsed = float(st.session_state.get("calibration_result_elapsed", 0.0) or 0.0)
-    metric_col1, metric_col2, metric_col3, metric_col4 = st.columns(4)
+    metric_col1, metric_col2, metric_col3, metric_col4, metric_col5 = st.columns(5)
     with metric_col1:
         st.metric("Samples used", f"{int(result.get('sample_size', len(detail))):,}")
     with metric_col2:
-        st.metric("Candidates", f"{int(result.get('total_candidates', 0)):,}")
+        st.metric("Candidate basis", f"{int(result.get('total_candidates', 0)):,}")
     with metric_col3:
         st.metric("Top-k", str(int(request["top_k"])))
     with metric_col4:
         st.metric("Elapsed", format_duration(elapsed))
+    with metric_col5:
+        st.metric("Mode", str(result.get("candidate_mode", "sample")))
 
     render_calibration_examples(feature_index_dir, detail, key_prefix="calibration_examples")
 
@@ -3874,6 +4101,235 @@ def calibration_tab(project: Dict, config: Dict) -> None:
     render_preview_image()
 
 
+def curation_report_root(project: Dict) -> Path:
+    return Path("artifacts") / "curation_reports" / slugify(str(project.get("name", "project")))
+
+
+def reduced_dataset_root(project: Dict) -> Path:
+    return Path("artifacts") / "reduced_datasets" / slugify(str(project.get("name", "project")))
+
+
+def latest_report_dir(root: Path) -> Optional[Path]:
+    if not root.exists():
+        return None
+    candidates = [path for path in root.iterdir() if path.is_dir() and (path / "summary.json").exists()]
+    if not candidates:
+        return None
+    return sorted(candidates, key=lambda path: path.stat().st_mtime, reverse=True)[0]
+
+
+def load_report_summary(report_dir: str) -> Dict:
+    path = Path(report_dir) / "summary.json"
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f) or {}
+
+
+def render_report_csv_preview(report_dir: Path, filename: str, title: str, key_prefix: str, max_rows: int = 300) -> None:
+    path = report_dir / filename
+    st.subheader(title)
+    if not path.exists():
+        st.caption(f"Not found: {path}")
+        return
+    try:
+        df = pd.read_csv(path, nrows=max_rows)
+    except Exception as exc:
+        st.warning(f"Failed to load {filename}: {exc}")
+        return
+    st.caption(f"{filename} | showing first {len(df):,} rows")
+    st.dataframe(df, use_container_width=True, hide_index=True, height=360, key=f"{key_prefix}_{filename}_table")
+    try:
+        data = path.read_bytes()
+        st.download_button(
+            f"Download {filename}",
+            data,
+            filename,
+            "text/csv",
+            key=f"{key_prefix}_{filename}_download",
+            use_container_width=True,
+        )
+    except Exception:
+        pass
+
+
+def curation_report_tab(project: Dict, config: Dict) -> None:
+    st.subheader("Curation Report")
+    feature_index_dir = str(project.get("feature_index_dir", ""))
+    root = Path(feature_index_dir)
+    if not (root / "index.faiss").exists() or not (root / "features.npy").exists() or not index_records_ready(root):
+        st.warning(f"Feature index is not ready: {feature_index_dir}")
+        return
+
+    st.caption(
+        "Builds original-feature kNN reports for near duplicates, cross-class overlaps, "
+        "representatives, and reduced dataset export candidates."
+    )
+
+    report_root = curation_report_root(project)
+    report_root.mkdir(parents=True, exist_ok=True)
+    latest_dir = latest_report_dir(report_root)
+
+    control_col1, control_col2, control_col3, control_col4 = st.columns(4)
+    with control_col1:
+        max_query_records = st.number_input(
+            "Sample records",
+            min_value=0,
+            max_value=1_000_000,
+            value=10000,
+            step=1000,
+            key="curation_max_query_records",
+            help="0 uses all records. Start with 10k-50k for fast review.",
+        )
+        top_k = st.number_input("Top-k", min_value=5, max_value=500, value=50, step=5, key="curation_top_k")
+    with control_col2:
+        rerank_k = st.number_input("Rerank-k", min_value=10, max_value=2000, value=200, step=10, key="curation_rerank_k")
+        batch_size = st.number_input("Batch size", min_value=16, max_value=2048, value=256, step=16, key="curation_batch_size")
+    with control_col3:
+        duplicate_threshold = st.slider(
+            "Duplicate sim",
+            min_value=0.80,
+            max_value=0.999,
+            value=0.98,
+            step=0.001,
+            format="%.3f",
+            key="curation_duplicate_threshold",
+        )
+        cross_threshold = st.slider(
+            "Cross-class sim",
+            min_value=0.50,
+            max_value=0.999,
+            value=0.90,
+            step=0.005,
+            format="%.3f",
+            key="curation_cross_threshold",
+        )
+    with control_col4:
+        class_filter = st.text_input("Class filter", value="", placeholder="all / fire / 0 / 0: fire", key="curation_class_filter")
+        size_filter = st.selectbox(
+            "Size filter",
+            [""] + list(SIZE_BUCKET_ORDER),
+            format_func=lambda value: "All" if not value else SIZE_BUCKET_LABELS.get(value, value),
+            key="curation_size_filter",
+        )
+
+    output_name_default = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_name = st.text_input("Report name", value=output_name_default, key="curation_report_name")
+    output_dir = report_root / slugify(output_name)
+
+    run_col1, run_col2 = st.columns([1, 3])
+    with run_col1:
+        run_report = st.button("Build Curation Report", type="primary", key="btn_build_curation_report", use_container_width=True)
+    with run_col2:
+        st.caption(f"Output: {output_dir}")
+
+    if run_report:
+        status = st.empty()
+        progress_bar = st.progress(0.0)
+        start = time.time()
+
+        def progress(done: int, total: int, message: str) -> None:
+            pct = 0.0 if total <= 0 else min(1.0, done / max(1, total))
+            progress_bar.progress(pct)
+            status.caption(progress_with_eta(int(done), int(total), message, start))
+
+        try:
+            result = build_curation_report(
+                CurationReportConfig(
+                    index_dir=feature_index_dir,
+                    output_dir=str(output_dir),
+                    max_query_records=int(max_query_records),
+                    top_k=int(top_k),
+                    rerank_k=int(rerank_k),
+                    seed=42,
+                    class_filter=str(class_filter),
+                    size_bucket=str(size_filter),
+                    duplicate_threshold=float(duplicate_threshold),
+                    cross_class_threshold=float(cross_threshold),
+                    batch_size=int(batch_size),
+                ),
+                progress=progress,
+            )
+            st.session_state["last_curation_report_dir"] = result["output_dir"]
+            progress_bar.progress(1.0)
+            status.success(f"Curation report complete in {format_duration(time.time() - start)}")
+        except Exception as exc:
+            status.error(f"Curation report failed: {exc}")
+
+    selected_report_default = st.session_state.get("last_curation_report_dir") or (str(latest_dir) if latest_dir else str(output_dir))
+    selected_report = st.text_input("Report directory", value=str(selected_report_default), key="curation_selected_report_dir")
+    selected_report_path = Path(selected_report)
+    if not (selected_report_path / "summary.json").exists():
+        st.info("Build or select a report directory to preview outputs.")
+        return
+
+    summary = load_report_summary(str(selected_report_path))
+    summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
+    with summary_col1:
+        st.metric("Sampled records", f"{int(summary.get('sampled_records', 0)):,}")
+    with summary_col2:
+        st.metric("Duplicate groups", f"{int(summary.get('duplicate_groups', 0)):,}")
+    with summary_col3:
+        st.metric("Near duplicate edges", f"{int(summary.get('near_duplicate_edges', 0)):,}")
+    with summary_col4:
+        st.metric("Cross-class edges", f"{int(summary.get('cross_class_edges', 0)):,}")
+
+    if summary.get("recommendation_counts"):
+        st.caption(f"Recommendations: {summary.get('recommendation_counts')}")
+    if summary.get("image_action_counts"):
+        st.caption(f"Image actions: {summary.get('image_action_counts')}")
+    if summary.get("partial_report"):
+        st.warning("This is a sampled curation report. Drop candidates are for review only and are not safe deletion decisions.")
+
+    prev_tab1, prev_tab2, prev_tab3, prev_tab4, prev_tab5, prev_tab6 = st.tabs(
+        ["Recommendations", "Duplicates", "Cross-Class", "Representatives", "Images", "Export"]
+    )
+    with prev_tab1:
+        render_report_csv_preview(selected_report_path, "curation_recommendations.csv", "Curation Recommendations", "curation_recs")
+    with prev_tab2:
+        render_report_csv_preview(selected_report_path, "near_duplicates.csv", "Near Duplicate Edges", "curation_dup_edges")
+        render_report_csv_preview(selected_report_path, "duplicate_groups.csv", "Duplicate Groups", "curation_dup_groups")
+    with prev_tab3:
+        render_report_csv_preview(selected_report_path, "cross_class_overlap.csv", "Cross-Class Overlap", "curation_cross")
+    with prev_tab4:
+        render_report_csv_preview(selected_report_path, "representatives.csv", "Representatives", "curation_representatives")
+        render_report_csv_preview(selected_report_path, "boundary_samples.csv", "Boundary Samples", "curation_boundary")
+        render_report_csv_preview(selected_report_path, "rare_samples.csv", "Rare Samples", "curation_rare")
+    with prev_tab5:
+        render_report_csv_preview(selected_report_path, "image_recommendations.csv", "Image-Level Recommendations", "curation_images")
+    with prev_tab6:
+        st.subheader("Reduced Dataset Export")
+        st.caption("Manifest mode is safest. Copy/hardlink creates a reduced YOLO-style folder from non-drop image recommendations.")
+        export_col1, export_col2, export_col3 = st.columns(3)
+        with export_col1:
+            export_name = st.text_input(
+                "Export name",
+                value=datetime.now().strftime("%Y%m%d_%H%M%S"),
+                key="curation_export_name",
+            )
+        with export_col2:
+            export_mode = st.selectbox("Mode", ["manifest", "copy", "hardlink"], index=0, key="curation_export_mode")
+        with export_col3:
+            export_dir = reduced_dataset_root(project) / slugify(export_name)
+            st.caption(f"Output: {export_dir}")
+        if st.button("Export Reduced Dataset", key="btn_export_reduced_dataset", use_container_width=True):
+            try:
+                result = export_reduced_dataset(
+                    report_dir=str(selected_report_path),
+                    output_dir=str(export_dir),
+                    images_root=str(project.get("images_dir", "")),
+                    labels_root=str(project.get("labels_dir", "")),
+                    data_yaml=str(project.get("data_yaml", "")),
+                    mode=str(export_mode),
+                )
+                st.success(
+                    f"Export complete: kept_images={result['kept_images']:,}, "
+                    f"drop_candidates={result['drop_image_candidates']:,}, output={result['output_dir']}"
+                )
+            except Exception as exc:
+                st.error(f"Export failed: {exc}")
+
+
 def status_panel(project: Optional[Dict]) -> None:
     if not project:
         st.warning("No active project selected.")
@@ -3926,8 +4382,15 @@ def search_page(config: Dict) -> None:
 
     status_panel(project)
 
-    tab_crop, tab_video, tab_cluster, tab_calibration, tab_last = st.tabs(
-        ["Crop Image Search", "Video Detection Search", "Feature Clustering", "Calibration", "Last Results"]
+    tab_crop, tab_video, tab_cluster, tab_curation, tab_calibration, tab_last = st.tabs(
+        [
+            "Crop Image Search",
+            "Video Detection Search",
+            "Feature Clustering",
+            "Curation Report",
+            "Calibration",
+            "Last Results",
+        ]
     )
     with tab_crop:
         crop_search_tab(project, config)
@@ -3939,6 +4402,8 @@ def search_page(config: Dict) -> None:
         render_preview_image()
     with tab_cluster:
         feature_cluster_tab(project, config)
+    with tab_curation:
+        curation_report_tab(project, config)
     with tab_calibration:
         calibration_tab(project, config)
     with tab_last:

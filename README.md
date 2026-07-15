@@ -168,3 +168,52 @@ These generated files can be large and are intentionally excluded from git.
 - Do not commit model weights, video files, datasets, or generated feature indexes.
 - Keep YOLO repositories configurable through the UI/project settings.
 - FAISS GPU use is recorded in `config.json` as `faiss_gpu_requested`, `faiss_gpu_used`, and `faiss_gpu_reason`.
+
+## Data Curation Roadmap
+
+For the research-backed plan on false-positive cause search, clustering, coreset selection, and training DB reduction, see:
+
+```text
+data_curation_research_and_clustering_plan.md
+```
+
+## Build A Curation Report
+
+The curation report uses the saved YOLO feature index directly. It does not re-extract model features.
+
+```powershell
+python -u scripts/build_curation_report.py `
+  --index-dir artifacts/yolo_feature_index_safety_env `
+  --output-dir artifacts/curation_reports/safety_env/report_10k `
+  --max-query-records 10000 `
+  --top-k 50 `
+  --rerank-k 200 `
+  --duplicate-threshold 0.98 `
+  --cross-class-threshold 0.90
+```
+
+Key outputs:
+
+```text
+curation_recommendations.csv
+image_recommendations.csv
+near_duplicates.csv
+duplicate_groups.csv
+cross_class_overlap.csv
+representatives.csv
+boundary_samples.csv
+rare_samples.csv
+summary.json
+```
+
+To create a reduced dataset manifest or copied dataset:
+
+```powershell
+python -u scripts/export_reduced_dataset.py `
+  --report-dir artifacts/curation_reports/safety_env/report_10k `
+  --output-dir artifacts/reduced_datasets/safety_env/report_10k `
+  --images-root V:\dataset\images `
+  --labels-root V:\dataset\labels `
+  --data-yaml data.yaml `
+  --mode manifest
+```
