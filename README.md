@@ -228,7 +228,7 @@ python -u scripts/export_similarity_reduction_plan.py `
 
 The UI exposes the same workflow under `Curation Report` -> `Similarity Reduction Planner`.
 
-Use the `Visual` tab before exporting. `Overview` starts with an at-a-glance sample board that shows representative crops and sampled drop/protected candidates across classes. `Evidence Map` renders one selected group with similarity lines, and `Group Compare` shows the same group as individual crop cards. This is the operator-facing proof view for checking that reduction candidates are visually redundant before running `copy` or `hardlink` export.
+Use the `Visual` tab before exporting. `Overview` shows record/image reduction summaries and class action charts. `Evidence Wall` renders multiple tight groups as one cached PNG, with representative crops connected to sampled drop/protected candidates. `Evidence Detail` renders one selected group with similarity lines, and `Group Compare` shows the same group as individual crop tiles. This is the operator-facing proof view for checking that reduction candidates are visually redundant before running `copy` or `hardlink` export.
 
 ## Notes
 

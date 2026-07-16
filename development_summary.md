@@ -1,7 +1,7 @@
 # YOLO Feature Search / Curation 개발 요약
 
 작성일: 2026-07-16  
-현재 커밋: `d060443`  
+현재 커밋: `git log --oneline -1` 기준 확인
 실행 URL: `http://localhost:8501`  
 주요 프로젝트: `fire_8class_w122`, `safety_env`
 
@@ -143,11 +143,10 @@ feature kNN 기반으로 다음 항목을 생성한다.
 - image keep/drop pie chart
 - group size vs mean similarity scatter
 - class별 summary table
-- at-a-glance sample board
 
-### 6.2 At-a-glance Sample Board
+### 6.2 Evidence Wall
 
-이번에 추가한 핵심 시각화다.
+여러 reduction group을 한 화면에서 비교하는 핵심 시각화다.
 
 한 화면에서 여러 유사 그룹의 실제 crop을 바로 볼 수 있다.
 
@@ -159,22 +158,23 @@ feature kNN 기반으로 다음 항목을 생성한다.
 - 빨강 = drop candidate
 - 노랑 = protected keep
 
-기본 board mode:
+기본 wall mode:
 
 - `One Top Group Per Class`: 클래스별 대표 중복 그룹을 하나씩 보여줌
 - `Largest Drop Groups`: drop 후보가 가장 많은 그룹 위주
 - `Largest Group`: group size가 큰 순서
 - `Highest Similarity`: 평균 similarity가 높은 순서
+- `Protected only`: cross-class protected record가 포함된 group만 표시
 
-성능상 네트워크 드라이브 이미지를 자동으로 수십 장 열면 앱이 느려질 수 있어서, `Generate Sample Board` 버튼으로 한 번 생성하고 PNG로 캐시한다.
+성능상 네트워크 드라이브 이미지를 자동으로 수십 장 열면 앱이 느려질 수 있어서, `Generate Evidence Wall` 버튼으로 한 번 생성하고 PNG로 캐시한다.
 
-현재 생성된 기본 board:
+기본 wall 캐시 경로 예:
 
 ```text
-artifacts/reduction_plans/fire_8class_w122/full_t0995/reduction_sample_board_All_One_Top_Group_Per_Class_8x4.png
+artifacts/reduction_plans/fire_8class_w122/full_t0995/reduction_evidence_wall_All_One_Top_Group_Per_Class_all_8x4.png
 ```
 
-### 6.3 Evidence Map
+### 6.3 Evidence Detail
 
 선택한 reduction group 하나를 상세하게 보여준다.
 
@@ -186,8 +186,8 @@ artifacts/reduction_plans/fire_8class_w122/full_t0995/reduction_sample_board_All
 
 용도:
 
-- sample board로 전체 패턴 확인
-- Evidence Map으로 특정 group 상세 확인
+- Evidence Wall로 여러 그룹의 전체 패턴 확인
+- Evidence Detail로 특정 group 상세 확인
 - Group Compare로 개별 crop 카드 확인
 
 ## 7. 실제 FireDB 분석 결과
@@ -278,7 +278,7 @@ label policy:
 운영 추천:
 
 1. 먼저 `manifest`로 결과 확인
-2. Visual tab에서 sample board / evidence map 확인
+2. Visual tab에서 Evidence Wall / Evidence Detail 확인
 3. 문제 없으면 `copy + filtered`로 실제 학습용 reduced dataset 생성
 
 CLI 예:
@@ -335,7 +335,7 @@ GitHub push 완료:
 ```text
 https://github.com/smyang03/faiss.git
 branch: main
-latest commit: d060443
+latest commit: `git log --oneline -1` 기준 확인
 ```
 
 ## 11. 운영 가이드
@@ -347,8 +347,8 @@ latest commit: d060443
 3. 검색된 DB neighbor를 다시 neighbor search
 4. `Feature Clustering`에서 class/cluster overlap 확인
 5. `Curation Report -> Similarity Reduction Planner`에서 reduction plan 선택
-6. `Visual -> Overview`의 sample board로 전체 중복 패턴 확인
-7. `Evidence Map`에서 특정 group 상세 검토
+6. `Visual -> Evidence Wall`에서 여러 group의 전체 중복 패턴 확인
+7. `Evidence Detail`에서 특정 group 상세 검토
 8. `Export`에서 `manifest` 또는 `copy + filtered` 실행
 9. reduced dataset으로 재학습 후 기존 full dataset과 성능 비교
 
@@ -361,8 +361,8 @@ latest commit: d060443
 
 ## 12. 다음 개선 후보
 
-- sample board에 group click -> Evidence Map 자동 이동
-- class별 reduction board를 한 번에 batch 생성
+- Evidence Wall에서 group click -> Evidence Detail 자동 이동
+- class별 Evidence Wall을 한 번에 batch 생성
 - reduced dataset 생성 후 원본/축소본 class 분포 비교 리포트
 - 학습 결과 mAP/오검출률 비교 리포트 연결
 - protected cross-class sample 전용 검수 화면 강화

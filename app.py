@@ -4869,7 +4869,7 @@ def build_reduction_sample_board(
     small_font = sheet_font(13)
     tiny_font = sheet_font(12)
 
-    draw.text((30, 22), "At-a-glance reduction sample board", fill=(248, 250, 252), font=title_font)
+    draw.text((30, 22), "Evidence Wall", fill=(248, 250, 252), font=title_font)
     draw.text(
         (30, 62),
         "Each row shows one tight feature group: kept representative on the left, visually redundant candidates connected by similarity lines.",
@@ -4937,7 +4937,7 @@ def build_reduction_sample_board(
 
     draw.text(
         (30, height - 29),
-        "Use this board as a first-pass visual check, then open Evidence Map / Group Compare for detailed review before export.",
+        "Use this wall as a first-pass visual check, then open Evidence Detail / Group Compare for detailed review before export.",
         fill=(148, 163, 184),
         font=small_font,
     )
@@ -4991,9 +4991,163 @@ def image_to_png_bytes(image: Image.Image) -> bytes:
     return buffer.getvalue()
 
 
-def reduction_sample_board_path(plan_dir: Path, class_filter: str, sort_mode: str, rows: int, samples: int) -> Path:
-    key = f"{slugify(str(class_filter))}_{slugify(str(sort_mode))}_{int(rows)}x{int(samples)}"
-    return plan_dir / f"reduction_sample_board_{key}.png"
+def reduction_evidence_wall_path(
+    plan_dir: Path,
+    class_filter: str,
+    sort_mode: str,
+    rows: int,
+    samples: int,
+    protected_only: bool,
+) -> Path:
+    scope = "protected" if protected_only else "all"
+    key = f"{slugify(str(class_filter))}_{slugify(str(sort_mode))}_{scope}_{int(rows)}x{int(samples)}"
+    return plan_dir / f"reduction_evidence_wall_{key}.png"
+
+
+def render_reduction_evidence_wall(plan_dir: Path, groups: pd.DataFrame, members: pd.DataFrame) -> None:
+    st.caption(
+        "Evidence Wall shows multiple tight groups in one cached image. "
+        "Each row is a miniature Evidence Map: representative crop, connected candidates, and similarity labels."
+    )
+    if groups.empty or members.empty:
+        st.info("No groups are available for Evidence Wall.")
+        return
+
+    board_classes = ["All"] + sorted(groups["class_name"].dropna().astype(str).unique().tolist())
+    wall_c1, wall_c2, wall_c3, wall_c4, wall_c5 = st.columns(5)
+    with wall_c1:
+        wall_class = st.selectbox("Wall class", board_classes, key="reduction_wall_class")
+    with wall_c2:
+        wall_sort = st.selectbox(
+            "Wall mode",
+            ["One Top Group Per Class", "Largest Drop Groups", "Largest Group", "Highest Similarity"],
+            index=0,
+            key="reduction_wall_sort",
+        )
+    with wall_c3:
+        wall_rows = st.number_input(
+            "Wall rows",
+            min_value=2,
+            max_value=16,
+            value=8,
+            step=1,
+            key="reduction_wall_rows",
+        )
+    with wall_c4:
+        wall_samples = st.number_input(
+            "Samples / row",
+            min_value=2,
+            max_value=7,
+            value=4,
+            step=1,
+            key="reduction_wall_samples",
+        )
+    with wall_c5:
+        protected_only = st.checkbox(
+            "Protected only",
+            value=False,
+            key="reduction_wall_protected_only",
+            help="Show groups that contain cross-class protected records.",
+        )
+
+    wall_groups = select_reduction_board_groups(
+        groups,
+        class_filter=str(wall_class),
+        sort_mode=str(wall_sort),
+        max_groups=max(int(wall_rows) * 4, int(wall_rows)),
+    )
+    if protected_only:
+        protected_group_ids = set(
+            members[
+                members["action"].astype(str).str.contains("PROTECTED", regex=False, na=False)
+            ]["reduction_group_id"].map(lambda value: safe_int(value, -1)).tolist()
+        )
+        wall_groups = wall_groups[
+            wall_groups["reduction_group_id"].map(lambda value: safe_int(value, -2)).isin(protected_group_ids)
+        ].copy()
+    wall_groups = wall_groups.head(int(wall_rows))
+
+    if wall_groups.empty:
+        st.warning("No groups match the Evidence Wall filters.")
+        return
+
+    wall_path = reduction_evidence_wall_path(
+        plan_dir,
+        class_filter=str(wall_class),
+        sort_mode=str(wall_sort),
+        rows=int(wall_rows),
+        samples=int(wall_samples),
+        protected_only=bool(protected_only),
+    )
+
+    action_col1, action_col2, action_col3 = st.columns([1, 1, 3])
+    with action_col1:
+        build_wall = st.button("Generate Evidence Wall", key="btn_generate_reduction_evidence_wall", use_container_width=True)
+    with action_col2:
+        refresh_wall = st.button("Refresh Wall", key="btn_refresh_reduction_evidence_wall", use_container_width=True)
+    with action_col3:
+        st.caption(f"Cached wall: {wall_path}")
+
+    if refresh_wall and wall_path.exists():
+        try:
+            wall_path.unlink()
+        except Exception as exc:
+            st.warning(f"Failed to remove cached wall: {exc}")
+
+    if build_wall or refresh_wall:
+        with st.spinner("Loading crop samples and writing Evidence Wall PNG..."):
+            wall = build_reduction_sample_board(
+                wall_groups,
+                members,
+                max_groups=int(wall_rows),
+                samples_per_group=int(wall_samples),
+            )
+        if wall is None:
+            st.warning("Could not build the Evidence Wall.")
+        else:
+            wall_path.parent.mkdir(parents=True, exist_ok=True)
+            wall.save(wall_path)
+            st.success(f"Evidence Wall generated: {wall_path}")
+
+    if wall_path.exists():
+        try:
+            with Image.open(wall_path) as wall_file:
+                wall_image = wall_file.convert("RGB").copy()
+            render_full_width_image(wall_image, caption=f"Evidence Wall | {wall_sort} | class={wall_class}")
+            st.download_button(
+                "Download Evidence Wall PNG",
+                wall_path.read_bytes(),
+                file_name=wall_path.name,
+                mime="image/png",
+                key=f"reduction_evidence_wall_png_{slugify(str(wall_class))}_{slugify(str(wall_sort))}_{int(wall_rows)}_{int(wall_samples)}_{int(protected_only)}",
+                use_container_width=True,
+            )
+        except Exception as exc:
+            st.warning(f"Cached Evidence Wall load failed: {exc}")
+    else:
+        st.info("Generate the Evidence Wall once. It will be cached in the reduction plan folder and shown instantly next time.")
+
+    columns = [
+        col
+        for col in [
+            "reduction_group_id",
+            "class_id",
+            "class_name",
+            "group_size",
+            "drop_candidates",
+            "keep_count",
+            "mean_similarity_to_primary",
+            "representative_file",
+        ]
+        if col in wall_groups.columns
+    ]
+    st.dataframe(
+        wall_groups[columns],
+        use_container_width=True,
+        hide_index=True,
+        height=260,
+        key="reduction_evidence_wall_groups",
+    )
 
 
 def render_reduction_visual_review(plan_dir: Path) -> None:
@@ -5017,7 +5171,9 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
 
     summary = load_reduction_summary(str(plan_dir))
 
-    review_tab0, review_tab1, review_tab2, review_tab3 = st.tabs(["Overview", "Evidence Map", "Drop Gallery", "Group Compare"])
+    review_tab0, review_tab1, review_tab2, review_tab3, review_tab4 = st.tabs(
+        ["Overview", "Evidence Wall", "Evidence Detail", "Drop Gallery", "Group Compare"]
+    )
     with review_tab0:
         st.caption("Use this overview to understand what would disappear before inspecting individual crops.")
         overview_col1, overview_col2, overview_col3 = st.columns(3)
@@ -5034,97 +5190,6 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
         render_reduction_flow_chart(summary)
 
         if not groups.empty and not members.empty:
-            st.subheader("At-a-glance Sample Board")
-            st.caption(
-                "Start here: this board shows what the reducible data actually looks like before you inspect tables. "
-                "One row is one tight group, with the representative and sampled drop/protected candidates side by side."
-            )
-            board_classes = ["All"] + sorted(groups["class_name"].dropna().astype(str).unique().tolist())
-            board_c1, board_c2, board_c3, board_c4 = st.columns(4)
-            with board_c1:
-                board_class = st.selectbox("Board class", board_classes, key="reduction_board_class")
-            with board_c2:
-                board_sort = st.selectbox(
-                    "Board mode",
-                    ["One Top Group Per Class", "Largest Drop Groups", "Largest Group", "Highest Similarity"],
-                    index=0,
-                    key="reduction_board_sort",
-                )
-            with board_c3:
-                board_groups_count = st.number_input(
-                    "Board rows",
-                    min_value=2,
-                    max_value=12,
-                    value=8,
-                    step=1,
-                    key="reduction_board_groups_count",
-                )
-            with board_c4:
-                board_samples = st.number_input(
-                    "Samples / row",
-                    min_value=2,
-                    max_value=7,
-                    value=4,
-                    step=1,
-                    key="reduction_board_samples",
-                )
-            board_groups = select_reduction_board_groups(
-                groups,
-                class_filter=str(board_class),
-                sort_mode=str(board_sort),
-                max_groups=int(board_groups_count),
-            )
-            if board_groups.empty:
-                st.warning("No groups match the sample board filters.")
-            else:
-                board_path = reduction_sample_board_path(
-                    plan_dir,
-                    class_filter=str(board_class),
-                    sort_mode=str(board_sort),
-                    rows=int(board_groups_count),
-                    samples=int(board_samples),
-                )
-                board_action_col1, board_action_col2 = st.columns([1, 3])
-                with board_action_col1:
-                    build_board = st.button(
-                        "Generate Sample Board",
-                        key="btn_generate_reduction_sample_board",
-                        use_container_width=True,
-                    )
-                with board_action_col2:
-                    st.caption(f"Cached board: {board_path}")
-                if build_board:
-                    with st.spinner("Loading crop samples and writing board PNG..."):
-                        board = build_reduction_sample_board(
-                            board_groups,
-                            members,
-                            max_groups=int(board_groups_count),
-                            samples_per_group=int(board_samples),
-                        )
-                    if board is None:
-                        st.warning("Could not build the sample board.")
-                    else:
-                        board_path.parent.mkdir(parents=True, exist_ok=True)
-                        board.save(board_path)
-                        st.success(f"Sample board generated: {board_path}")
-                if board_path.exists():
-                    try:
-                        with Image.open(board_path) as board_file:
-                            board_image = board_file.convert("RGB").copy()
-                        render_full_width_image(board_image, caption=f"Reduction sample board | {board_sort} | class={board_class}")
-                        st.download_button(
-                            "Download sample board PNG",
-                            board_path.read_bytes(),
-                            file_name=board_path.name,
-                            mime="image/png",
-                            key=f"reduction_sample_board_png_{slugify(str(board_class))}_{slugify(str(board_sort))}_{int(board_groups_count)}_{int(board_samples)}",
-                            use_container_width=True,
-                        )
-                    except Exception as exc:
-                        st.warning(f"Cached sample board load failed: {exc}")
-                else:
-                    st.info("Generate the sample board once. It will be cached in the reduction plan folder and shown instantly next time.")
-
             class_summary = members.copy()
             class_summary["_is_drop"] = class_summary["action"].astype(str).str.startswith("DROP")
             class_summary["_is_protected"] = class_summary["action"].astype(str).str.contains("PROTECTED", regex=False)
@@ -5244,11 +5309,14 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
             st.plotly_chart(fig, use_container_width=True, key="reduction_overview_group_scatter")
 
     with review_tab1:
+        render_reduction_evidence_wall(plan_dir, groups, members)
+
+    with review_tab2:
         if groups.empty:
             st.info("No tight groups available.")
             return
         st.caption(
-            "This sheet is the visual proof view: one kept representative is connected to similar records that the plan can remove or protect."
+            "This sheet is the detail proof view: one kept representative is connected to similar records that the plan can remove or protect."
         )
         evidence_groups = groups.copy()
         if "drop_candidates" in evidence_groups.columns:
@@ -5309,9 +5377,9 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
             if sheet is None:
                 st.warning("Could not build evidence sheet.")
             else:
-                render_full_width_image(sheet, caption=f"Reduction evidence map | group={selected_group_id}")
+                render_full_width_image(sheet, caption=f"Evidence Detail | group={selected_group_id}")
                 st.download_button(
-                    "Download evidence PNG",
+                    "Download Evidence Detail PNG",
                     image_to_png_bytes(sheet),
                     file_name=f"reduction_evidence_group_{selected_group_id}.png",
                     mime="image/png",
@@ -5343,7 +5411,7 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
                     key=f"reduction_evidence_rows_{selected_group_id}",
                 )
 
-    with review_tab2:
+    with review_tab3:
         if drops.empty:
             st.info("No drop candidates in this plan.")
             return
@@ -5395,7 +5463,7 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
                         role="DROP",
                     )
 
-    with review_tab3:
+    with review_tab4:
         if groups.empty:
             st.info("No tight groups available.")
             return
