@@ -145,6 +145,11 @@ def apply_theme() -> None:
         [data-testid="stDataFrame"] * {
             max-width: 100% !important;
         }
+        [data-testid="stVerticalBlockBorderWrapper"] {
+            border-color: #1d3a57 !important;
+            background: #0a1b2d !important;
+            border-radius: 8px !important;
+        }
         [data-testid="stToolbar"],
         [data-testid="stToolbar"] * {
             color: #dbeafe !important;
@@ -4979,6 +4984,13 @@ def reduction_keep_overrides_path(plan_dir: Path) -> Path:
     return Path(plan_dir) / "reduction_keep_overrides.json"
 
 
+REVIEW_STATUS_OPTIONS = ["Unreviewed", "Drop confirmed", "Keep", "Hold"]
+
+
+def reduction_review_status_path(plan_dir: Path) -> Path:
+    return Path(plan_dir) / "reduction_review_status.json"
+
+
 def load_reduction_keep_override_indices(plan_dir: Path) -> set:
     path = reduction_keep_overrides_path(Path(plan_dir))
     if not path.exists():
@@ -5021,6 +5033,61 @@ def set_reduction_keep_override(plan_dir: Path, record_idx: int, enabled: bool) 
     save_reduction_keep_override_indices(Path(plan_dir), indices)
 
 
+def load_reduction_review_statuses(plan_dir: Path) -> Dict[int, str]:
+    path = reduction_review_status_path(Path(plan_dir))
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception:
+        return {}
+    raw = data.get("records", data if isinstance(data, dict) else {})
+    if not isinstance(raw, dict):
+        return {}
+    statuses: Dict[int, str] = {}
+    for key, value in raw.items():
+        try:
+            record_idx = int(float(key))
+        except Exception:
+            continue
+        status = str(value or "Unreviewed")
+        if status not in REVIEW_STATUS_OPTIONS:
+            status = "Unreviewed"
+        statuses[record_idx] = status
+    return statuses
+
+
+def save_reduction_review_statuses(plan_dir: Path, statuses: Dict[int, str]) -> None:
+    clean = {
+        str(int(record_idx)): str(status)
+        for record_idx, status in statuses.items()
+        if str(status) in REVIEW_STATUS_OPTIONS and str(status) != "Unreviewed"
+    }
+    payload = {
+        "records": dict(sorted(clean.items(), key=lambda item: int(item[0]))),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    path = reduction_review_status_path(Path(plan_dir))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def set_reduction_review_status(plan_dir: Path, record_idx: int, status: str) -> None:
+    record_idx = int(record_idx)
+    status = str(status or "Unreviewed")
+    if status not in REVIEW_STATUS_OPTIONS:
+        status = "Unreviewed"
+    statuses = load_reduction_review_statuses(Path(plan_dir))
+    if status == "Unreviewed":
+        statuses.pop(record_idx, None)
+    else:
+        statuses[record_idx] = status
+    save_reduction_review_statuses(Path(plan_dir), statuses)
+    set_reduction_keep_override(Path(plan_dir), record_idx, status in {"Keep", "Hold"})
+
+
 def annotate_reduction_keep_overrides(frame: pd.DataFrame, override_indices: set) -> pd.DataFrame:
     if frame.empty:
         return frame.copy()
@@ -5035,6 +5102,16 @@ def annotate_reduction_keep_overrides(frame: pd.DataFrame, override_indices: set
     if "action" not in work.columns:
         work["action"] = ""
     work.loc[override_mask, "action"] = "KEEP_USER_OVERRIDE"
+    return work
+
+
+def annotate_reduction_review_statuses(frame: pd.DataFrame, review_statuses: Dict[int, str]) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    work = frame.copy()
+    if "record_idx" not in work.columns:
+        work["record_idx"] = work.get("record_id", pd.Series(range(len(work)), index=work.index))
+    work["review_status"] = work["record_idx"].map(lambda value: review_statuses.get(safe_int(value, -1), "Unreviewed"))
     return work
 
 
@@ -5078,6 +5155,9 @@ def render_reduction_record_tile(row, key_prefix: str, badge: str, role: str = "
     action = str(getattr(row, "action", role or ""))
     original_action = str(getattr(row, "original_action", action))
     is_user_keep = bool(getattr(row, "user_keep_override", False))
+    review_status = str(getattr(row, "review_status", "Unreviewed"))
+    if review_status not in REVIEW_STATUS_OPTIONS:
+        review_status = "Unreviewed"
     group_id = getattr(row, "reduction_group_id", "")
     sim = getattr(row, "similarity_to_primary", None)
     sim_text = f" | sim {safe_float(sim):.4f}" if sim is not None and pd.notna(sim) else ""
@@ -5085,40 +5165,39 @@ def render_reduction_record_tile(row, key_prefix: str, badge: str, role: str = "
     file_name = Path(record.image_path).name
     meta_line = f"G{group_id} | {record.class_id} {record.class_name}{sim_text}"
 
-    st.markdown(
-        f"""
-        <div class="reduction-tile">
-        """,
-        unsafe_allow_html=True,
-    )
-    thumb_ok = render_record_thumb(record, badge=badge, wrapper_class="reduction-thumb")
-    if not thumb_ok:
-        st.caption("crop load failed")
-    st.markdown(
-        f"""
-          <div class="reduction-tile-meta">
-            <strong>{html.escape(str(role_text))}</strong> | {html.escape(meta_line)}<br>
-            {html.escape(file_name)}
-          </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if thumb_ok and st.button("View", key=f"{key_prefix}_view", use_container_width=True):
-        set_preview_image(
-            crop_from_record(record),
-            f"{role_text} | {record.class_id} {record.class_name} | {file_name}",
+    with st.container(border=True):
+        thumb_ok = render_record_thumb(record, badge=badge, wrapper_class="reduction-thumb")
+        if not thumb_ok:
+            st.caption("crop load failed")
+        st.markdown(
+            f"""
+              <div class="reduction-tile-meta">
+                <strong>{html.escape(str(role_text))}</strong> | {html.escape(meta_line)}<br>
+                {html.escape(file_name)}
+              </div>
+            """,
+            unsafe_allow_html=True,
         )
-        st.rerun()
-    if st.button("Data", key=f"{key_prefix}_data", use_container_width=True):
-        open_data_location(record.image_path)
-    if original_action.startswith("DROP") and plan_dir is not None:
-        keep_checked = st.checkbox("Keep", value=bool(is_user_keep), key=f"{key_prefix}_keep_override")
-        if bool(keep_checked) != bool(is_user_keep):
-            record_idx = safe_int(getattr(row, "record_idx", record.record_id), record.record_id)
-            set_reduction_keep_override(Path(plan_dir), int(record_idx), bool(keep_checked))
+        if thumb_ok and st.button("View", key=f"{key_prefix}_view", use_container_width=True):
+            set_preview_image(
+                crop_from_record(record),
+                f"{role_text} | {record.class_id} {record.class_name} | {file_name}",
+            )
             st.rerun()
-    render_path_selector(record.image_path, record, key=f"{key_prefix}_select")
-    st.markdown("</div>", unsafe_allow_html=True)
+        if st.button("Data", key=f"{key_prefix}_data", use_container_width=True):
+            open_data_location(record.image_path)
+        if original_action.startswith("DROP") and plan_dir is not None:
+            selected_status = st.selectbox(
+                "Review",
+                REVIEW_STATUS_OPTIONS,
+                index=REVIEW_STATUS_OPTIONS.index(review_status),
+                key=f"{key_prefix}_review_status",
+            )
+            if selected_status != review_status:
+                record_idx = safe_int(getattr(row, "record_idx", record.record_id), record.record_id)
+                set_reduction_review_status(Path(plan_dir), int(record_idx), str(selected_status))
+                st.rerun()
+        render_path_selector(record.image_path, record, key=f"{key_prefix}_select")
 
 
 def boolish_series(series: pd.Series) -> pd.Series:
@@ -5854,7 +5933,7 @@ def render_reduction_decision_board(plan_dir: Path, groups: pd.DataFrame, member
     with ctrl5:
         default_min_sim = float((summary or {}).get("tight_threshold", 0.0) or 0.0)
         board_min_mean_sim = st.slider(
-            "Min mean sim",
+            "Min mean sim (view)",
             min_value=0.0,
             max_value=1.0,
             value=min(1.0, max(0.0, default_min_sim)),
@@ -5968,12 +6047,18 @@ def prepare_reduction_explorer_frame(groups: pd.DataFrame, members: pd.DataFrame
         frame["is_protected"] = frame["action"].astype(str).str.contains("PROTECTED", regex=False)
     if "user_keep_override" not in frame.columns:
         frame["user_keep_override"] = False
+    if "review_status" not in frame.columns:
+        frame["review_status"] = "Unreviewed"
 
     frame["_record_idx_int"] = frame["record_idx"].map(lambda value: safe_int(value, -1)).astype(int)
     frame["_group_id_int"] = frame.get("reduction_group_id", -1).map(lambda value: safe_int(value, -1)).astype(int)
     frame["_sim"] = pd.to_numeric(frame["similarity_to_primary"], errors="coerce").fillna(0.0).astype(float)
     frame["_is_user_keep_override"] = boolish_series(frame["user_keep_override"])
     frame["_is_drop"] = frame["action"].astype(str).str.startswith("DROP") & ~frame["_is_user_keep_override"]
+    frame["_review_status"] = frame["review_status"].astype(str).where(
+        frame["review_status"].astype(str).isin(REVIEW_STATUS_OPTIONS),
+        "Unreviewed",
+    )
     frame["_is_rep"] = boolish_series(frame["is_representative"])
     frame["_is_protected"] = boolish_series(frame["is_protected"])
     frame["_action_group"] = frame["action"].map(reduction_action_group)
@@ -6007,6 +6092,7 @@ def filter_reduction_explorer_frame(
     frame: pd.DataFrame,
     class_filter: str,
     action_filter: str,
+    review_filter: str,
     size_filter: str,
     group_query: str,
     text_query: str,
@@ -6019,6 +6105,8 @@ def filter_reduction_explorer_frame(
         work = work[work["_class_label"].astype(str) == str(class_filter)]
     if action_filter != "All":
         work = work[work["_action_group"].astype(str) == str(action_filter)]
+    if review_filter != "All":
+        work = work[work["_review_status"].astype(str) == str(review_filter)]
     if size_filter != "All":
         work = work[work["size_bucket"].astype(str) == str(size_filter)]
     if min_similarity > 0:
@@ -6073,6 +6161,7 @@ def reduction_explorer_preset_defaults(preset: str) -> Dict[str, Any]:
     base = {
         "reduction_explorer_class": "All",
         "reduction_explorer_action": "All",
+        "reduction_explorer_review": "All",
         "reduction_explorer_size": "All",
         "reduction_explorer_group_query": "",
         "reduction_explorer_text_query": "",
@@ -6167,7 +6256,7 @@ def render_reduction_field_browser(frame: pd.DataFrame) -> None:
         frame["_action_group"].astype(str).value_counts(),
         "reduction_explorer_action",
         "reduction_field_action",
-        max_rows=5,
+        max_rows=6,
     )
     render_field_value_rows(
         "size",
@@ -6192,37 +6281,41 @@ def render_reduction_explorer_tile(
     sim = safe_float(getattr(row, "similarity_to_primary", getattr(row, "_sim", 0.0)), 0.0)
     original_action = str(getattr(row, "original_action", action))
     is_user_keep = bool(getattr(row, "user_keep_override", getattr(row, "_is_user_keep_override", False)))
+    review_status = str(getattr(row, "review_status", getattr(row, "_review_status", "Unreviewed")))
+    if review_status not in REVIEW_STATUS_OPTIONS:
+        review_status = "Unreviewed"
     badge_prefix = "USER KEEP" if is_user_keep else ("DROP" if action.startswith("DROP") else ("REP" if "REPRESENTATIVE" in action else "KEEP"))
     badge = f"{badge_prefix} {sim:.3f}" if sim > 0 else badge_prefix
     selected_class = " explorer-tile-selected" if selected_record_idx is not None and int(selected_record_idx) == int(record_idx) else ""
-    st.markdown(
-        f"""
-        <div class="explorer-tile{selected_class}">
-        """,
-        unsafe_allow_html=True,
-    )
-    thumb_ok = render_record_thumb(record, badge=badge, wrapper_class="explorer-thumb")
-    if not thumb_ok:
-        st.caption("crop load failed")
-    st.markdown(
-        f"""
-          <div class="explorer-tile-meta">
-            <strong>{html.escape(action_group)}</strong> | G{group_id} | rec={record_idx}<br>
-            {record.class_id} {html.escape(record.class_name)} | sim={sim:.4f}<br>
-            {html.escape(Path(record.image_path).name)}
-          </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    if st.button("Open", key=f"{key_prefix}_open", use_container_width=True):
-        st.session_state["reduction_explorer_selected"] = int(record_idx)
-    if original_action.startswith("DROP") and plan_dir is not None:
-        keep_checked = st.checkbox("Keep", value=bool(is_user_keep), key=f"{key_prefix}_keep_override")
-        if bool(keep_checked) != bool(is_user_keep):
-            set_reduction_keep_override(Path(plan_dir), int(record_idx), bool(keep_checked))
-            st.rerun()
-    render_path_selector(record.image_path, record, key=f"{key_prefix}_select")
-    st.markdown("</div>", unsafe_allow_html=True)
+    with st.container(border=True):
+        if selected_class:
+            st.markdown('<div class="explorer-status-line">Selected sample</div>', unsafe_allow_html=True)
+        thumb_ok = render_record_thumb(record, badge=badge, wrapper_class="explorer-thumb")
+        if not thumb_ok:
+            st.caption("crop load failed")
+        st.markdown(
+            f"""
+              <div class="explorer-tile-meta">
+                <strong>{html.escape(action_group)}</strong> | G{group_id} | rec={record_idx}<br>
+                {record.class_id} {html.escape(record.class_name)} | sim={sim:.4f}<br>
+                {html.escape(Path(record.image_path).name)}
+              </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        if st.button("Open", key=f"{key_prefix}_open", use_container_width=True):
+            st.session_state["reduction_explorer_selected"] = int(record_idx)
+        if original_action.startswith("DROP") and plan_dir is not None:
+            selected_status = st.selectbox(
+                "Review",
+                REVIEW_STATUS_OPTIONS,
+                index=REVIEW_STATUS_OPTIONS.index(review_status),
+                key=f"{key_prefix}_review_status",
+            )
+            if selected_status != review_status:
+                set_reduction_review_status(Path(plan_dir), int(record_idx), str(selected_status))
+                st.rerun()
+        render_path_selector(record.image_path, record, key=f"{key_prefix}_select")
 
 
 def render_reduction_record_inspector(
@@ -6349,20 +6442,23 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
         st.markdown('<div class="fo-pane-title">Filters</div>', unsafe_allow_html=True)
         class_options = ["All"] + sorted(frame["_class_label"].dropna().astype(str).unique().tolist())
         action_options = ["All"] + ["Drop candidates", "User keeps", "Representatives", "Protected keeps", "Other keeps"]
+        review_options = ["All"] + REVIEW_STATUS_OPTIONS
         size_options = ["All"] + sorted(frame["size_bucket"].dropna().astype(str).unique().tolist())
         class_filter = st.selectbox("Class", class_options, key="reduction_explorer_class")
         action_filter = st.selectbox("Action", action_options, key="reduction_explorer_action")
+        review_filter = st.selectbox("Review", review_options, key="reduction_explorer_review")
         size_filter = st.selectbox("Size", size_options, key="reduction_explorer_size")
         group_query = st.text_input("Group / file quick filter", value="", key="reduction_explorer_group_query")
         text_query = st.text_input("Text search", value="", key="reduction_explorer_text_query")
         min_similarity = st.slider(
-            "Min similarity",
+            "Min similarity (view)",
             min_value=0.0,
             max_value=1.0,
             value=0.0,
             step=0.001,
             format="%.3f",
             key="reduction_explorer_min_similarity",
+            help="View filter only. It does not change the saved reduction plan threshold.",
         )
         sort_mode = st.selectbox(
             "Sort",
@@ -6379,6 +6475,7 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
         frame,
         class_filter=class_filter,
         action_filter=action_filter,
+        review_filter=review_filter,
         size_filter=size_filter,
         group_query=group_query,
         text_query=text_query,
@@ -6390,6 +6487,7 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
         {
             "class": class_filter,
             "action": action_filter,
+            "review": review_filter,
             "size": size_filter,
             "group_query": group_query,
             "text_query": text_query,
@@ -6415,7 +6513,7 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
             grouped_records=filtered["_group_id_int"].nunique() if not filtered.empty else 0,
             selected_record_idx=selected_record_idx_for_bar,
         )
-        metric_cols = st.columns(5)
+        metric_cols = st.columns(6)
         with metric_cols[0]:
             render_explorer_metric("filtered records", f"{len(filtered):,}")
         with metric_cols[1]:
@@ -6423,8 +6521,11 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
         with metric_cols[2]:
             render_explorer_metric("user keeps", f"{int(filtered['_is_user_keep_override'].sum()) if not filtered.empty else 0:,}")
         with metric_cols[3]:
-            render_explorer_metric("groups", f"{filtered['_group_id_int'].nunique() if not filtered.empty else 0:,}")
+            reviewed = int((filtered["_review_status"].astype(str) != "Unreviewed").sum()) if not filtered.empty else 0
+            render_explorer_metric("reviewed", f"{reviewed:,}")
         with metric_cols[4]:
+            render_explorer_metric("groups", f"{filtered['_group_id_int'].nunique() if not filtered.empty else 0:,}")
+        with metric_cols[5]:
             mean_sim = float(filtered["_sim"].mean()) if not filtered.empty else 0.0
             render_explorer_metric("mean similarity", f"{mean_sim:.4f}")
 
@@ -6691,18 +6792,21 @@ def render_reduction_embedding_explorer(plan_dir: Path, groups: pd.DataFrame, me
         st.markdown("**Embedding Filters**")
         class_options = ["All"] + sorted(frame["_class_label"].dropna().astype(str).unique().tolist())
         action_options = ["All"] + ["Drop candidates", "User keeps", "Representatives", "Protected keeps", "Other keeps"]
+        review_options = ["All"] + REVIEW_STATUS_OPTIONS
         size_options = ["All"] + sorted(frame["size_bucket"].dropna().astype(str).unique().tolist())
         class_filter = st.selectbox("Class", class_options, key="reduction_embedding_class")
         action_filter = st.selectbox("Action", action_options, key="reduction_embedding_action")
+        review_filter = st.selectbox("Review", review_options, key="reduction_embedding_review")
         size_filter = st.selectbox("Size", size_options, key="reduction_embedding_size")
         min_similarity = st.slider(
-            "Min similarity",
+            "Min similarity (view)",
             min_value=0.0,
             max_value=1.0,
             value=0.0,
             step=0.001,
             format="%.3f",
             key="reduction_embedding_min_similarity",
+            help="View filter only. It does not change the saved reduction plan threshold.",
         )
         projection = st.radio("Projection", ["2D", "3D"], horizontal=True, key="reduction_embedding_projection")
         color_by = st.selectbox("Color by", ["Class", "Action", "Size", "Group"], key="reduction_embedding_color_by")
@@ -6723,6 +6827,7 @@ def render_reduction_embedding_explorer(plan_dir: Path, groups: pd.DataFrame, me
         frame,
         class_filter=class_filter,
         action_filter=action_filter,
+        review_filter=review_filter,
         size_filter=size_filter,
         group_query="",
         text_query="",
@@ -6735,6 +6840,7 @@ def render_reduction_embedding_explorer(plan_dir: Path, groups: pd.DataFrame, me
         "feature_index_dir": feature_index_dir,
         "class_filter": class_filter,
         "action_filter": action_filter,
+        "review_filter": review_filter,
         "size_filter": size_filter,
         "min_similarity": float(min_similarity),
         "projection": projection,
@@ -6861,9 +6967,13 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
 
     summary = load_reduction_summary(str(plan_dir))
     override_indices = load_reduction_keep_override_indices(plan_dir)
+    review_statuses = load_reduction_review_statuses(plan_dir)
     members = annotate_reduction_keep_overrides(members, override_indices)
     drops = annotate_reduction_keep_overrides(drops, override_indices)
+    members = annotate_reduction_review_statuses(members, review_statuses)
+    drops = annotate_reduction_review_statuses(drops, review_statuses)
     valid_override_count = int(boolish_series(members.get("user_keep_override", pd.Series([], dtype=bool))).sum()) if not members.empty else 0
+    reviewed_count = int((members.get("review_status", pd.Series([], dtype=str)).astype(str) != "Unreviewed").sum()) if not members.empty else 0
 
     review_modes = [
         "Overview",
@@ -6882,6 +6992,8 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
     )
     if valid_override_count:
         st.success(f"User keep overrides active: {valid_override_count:,} records will be kept during export.")
+    if reviewed_count:
+        st.caption(f"Reviewed records: {reviewed_count:,} / {len(members):,}")
     if review_mode == "Overview":
         st.caption("Use this overview to understand what would disappear before inspecting individual crops.")
         overview_col1, overview_col2, overview_col3 = st.columns(3)
@@ -7138,10 +7250,14 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
             classes = ["All"] + sorted(drops["class_name"].dropna().astype(str).unique().tolist())
             selected_class = st.selectbox("Drop class", classes, key="reduction_visual_drop_class")
         with f2:
-            review_status = st.selectbox("Review", ["All", "Still dropped", "User keeps"], key="reduction_visual_drop_review")
+            review_status = st.selectbox(
+                "Review",
+                ["All records", "Still dropped", "User keeps"] + REVIEW_STATUS_OPTIONS,
+                key="reduction_visual_drop_review",
+            )
         with f3:
             min_drop_similarity = st.slider(
-                "Min sim",
+                "Min sim (view)",
                 min_value=0.0,
                 max_value=1.0,
                 value=0.0,
@@ -7167,6 +7283,8 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
             gallery = gallery[effective_drop_mask(gallery)]
         elif review_status == "User keeps":
             gallery = gallery[boolish_series(gallery.get("user_keep_override", pd.Series([False] * len(gallery), index=gallery.index)))]
+        elif review_status in REVIEW_STATUS_OPTIONS:
+            gallery = gallery[gallery.get("review_status", pd.Series(["Unreviewed"] * len(gallery), index=gallery.index)).astype(str) == str(review_status)]
         if min_drop_similarity > 0 and "similarity_to_primary" in gallery.columns:
             gallery = gallery[gallery["similarity_to_primary"].map(lambda value: safe_float(value, 0.0)) >= float(min_drop_similarity)]
         if gallery.empty:
@@ -7256,7 +7374,7 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
                 )
             with group_ctrl2:
                 group_min_sim = st.slider(
-                    "Group min sim",
+                    "Group min sim (view)",
                     min_value=0.0,
                     max_value=1.0,
                     value=0.0,
@@ -7462,25 +7580,29 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
     if summary.get("partial_plan"):
         st.warning("This is a sampled reduction plan. Record-level candidates are useful for review, but image deletion/export exclusions are disabled for sample-only drops.")
 
-    red_tab1, red_tab2, red_tab3, red_tab4, red_tab5, red_tab6 = st.tabs(
-        ["Visual", "Groups", "Members", "Drop/Keep", "Images", "Export"]
+    reduction_view = st.radio(
+        "Reduction view",
+        ["Visual", "Groups", "Members", "Drop/Keep", "Images", "Export"],
+        horizontal=True,
+        key="reduction_report_view",
     )
-    with red_tab1:
+    if reduction_view == "Visual":
         render_reduction_visual_review(selected_plan_path)
-    with red_tab2:
+    elif reduction_view == "Groups":
         render_report_csv_preview(selected_plan_path, "reduction_groups.csv", "Tight Reduction Groups", "reduction_groups")
         render_report_csv_preview(selected_plan_path, "reduction_tight_edges.csv", "Tight Similarity Edges", "reduction_edges")
-    with red_tab3:
+    elif reduction_view == "Members":
         render_report_csv_preview(selected_plan_path, "reduction_group_members.csv", "Group Members", "reduction_members")
-    with red_tab4:
+    elif reduction_view == "Drop/Keep":
         render_report_csv_preview(selected_plan_path, "reduction_drop_records.csv", "Drop Record Candidates", "reduction_drop_records")
         render_report_csv_preview(selected_plan_path, "reduction_keep_records.csv", "Keep Records", "reduction_keep_records")
-    with red_tab5:
+    elif reduction_view == "Images":
         render_report_csv_preview(selected_plan_path, "reduction_image_plan.csv", "Image-Level Plan", "reduction_images")
-    with red_tab6:
+    elif reduction_view == "Export":
         st.subheader("Export Similarity-Reduced Dataset")
         st.caption("Manifest mode writes review lists only. Copy/hardlink creates a runnable reduced YOLO dataset.")
         image_plan_path = selected_plan_path / "reduction_image_plan.csv"
+        partial_label_images_preview = 0
         if image_plan_path.exists():
             try:
                 image_plan_preview = pd.read_csv(image_plan_path)
@@ -7501,7 +7623,17 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
                     int(count) for action, count in image_action_counts.items() if str(action).startswith("DROP")
                 )
                 keep_images_preview = int(len(image_plan_preview) - drop_images_preview)
-                x1, x2, x3, x4 = st.columns(4)
+                if {"planned_records", "drop_record_candidates"}.issubset(set(image_plan_preview.columns)):
+                    partial_label_images_preview = int(
+                        (
+                            (image_plan_preview["drop_record_candidates"].map(lambda value: safe_int(value, 0)) > 0)
+                            & (
+                                image_plan_preview["drop_record_candidates"].map(lambda value: safe_int(value, 0))
+                                < image_plan_preview["planned_records"].map(lambda value: safe_int(value, 0))
+                            )
+                        ).sum()
+                    )
+                x1, x2, x3, x4, x5 = st.columns(5)
                 with x1:
                     st.metric("Export keep images", f"{keep_images_preview:,}")
                 with x2:
@@ -7509,6 +7641,8 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
                 with x3:
                     st.metric("Record drop candidates", f"{effective_drop_records:,}", delta=f"-{valid_override_count:,} user keeps" if valid_override_count else None)
                 with x4:
+                    st.metric("Partial-label images", f"{partial_label_images_preview:,}")
+                with x5:
                     st.metric("Record reduction", f"{float(summary.get('record_reduction_pct_of_planned', 0.0)):.2f}%")
             except Exception as exc:
                 st.caption(f"Export preview unavailable: {exc}")
@@ -7537,6 +7671,8 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
                 "Filtered export rewrites YOLO txt files with only kept bbox records. "
                 "This is the actual reduced training dataset, not only an image list."
             )
+        if partial_label_images_preview and str(label_policy) == "filtered":
+            st.warning(f"{partial_label_images_preview:,} images contain mixed keep/drop bbox records. Filtered label export will rewrite YOLO txt annotations.")
         if st.button("Export Similarity Reduction", key="btn_export_similarity_reduction", use_container_width=True):
             try:
                 result = export_similarity_reduction_plan(
@@ -7690,23 +7826,26 @@ def curation_report_tab(project: Dict, config: Dict) -> None:
     if summary.get("partial_report"):
         st.warning("This is a sampled curation report. Drop candidates are for review only and are not safe deletion decisions.")
 
-    prev_tab1, prev_tab2, prev_tab3, prev_tab4, prev_tab5, prev_tab6 = st.tabs(
-        ["Recommendations", "Duplicates", "Cross-Class", "Representatives", "Images", "Export"]
+    report_view = st.radio(
+        "Report view",
+        ["Recommendations", "Duplicates", "Cross-Class", "Representatives", "Images", "Export"],
+        horizontal=True,
+        key="curation_report_view",
     )
-    with prev_tab1:
+    if report_view == "Recommendations":
         render_report_csv_preview(selected_report_path, "curation_recommendations.csv", "Curation Recommendations", "curation_recs")
-    with prev_tab2:
+    elif report_view == "Duplicates":
         render_report_csv_preview(selected_report_path, "near_duplicates.csv", "Near Duplicate Edges", "curation_dup_edges")
         render_report_csv_preview(selected_report_path, "duplicate_groups.csv", "Duplicate Groups", "curation_dup_groups")
-    with prev_tab3:
+    elif report_view == "Cross-Class":
         render_report_csv_preview(selected_report_path, "cross_class_overlap.csv", "Cross-Class Overlap", "curation_cross")
-    with prev_tab4:
+    elif report_view == "Representatives":
         render_report_csv_preview(selected_report_path, "representatives.csv", "Representatives", "curation_representatives")
         render_report_csv_preview(selected_report_path, "boundary_samples.csv", "Boundary Samples", "curation_boundary")
         render_report_csv_preview(selected_report_path, "rare_samples.csv", "Rare Samples", "curation_rare")
-    with prev_tab5:
+    elif report_view == "Images":
         render_report_csv_preview(selected_report_path, "image_recommendations.csv", "Image-Level Recommendations", "curation_images")
-    with prev_tab6:
+    elif report_view == "Export":
         st.subheader("Reduced Dataset Export")
         st.caption("Manifest mode is safest. Copy/hardlink creates a reduced YOLO-style folder from non-drop image recommendations.")
         export_col1, export_col2, export_col3 = st.columns(3)
@@ -7791,7 +7930,8 @@ def search_page(config: Dict) -> None:
 
     status_panel(project)
 
-    tab_crop, tab_video, tab_cluster, tab_curation, tab_calibration, tab_last = st.tabs(
+    search_mode = st.radio(
+        "Search workflow",
         [
             "Crop Image Search",
             "Video Detection Search",
@@ -7799,23 +7939,25 @@ def search_page(config: Dict) -> None:
             "Curation Report",
             "Calibration",
             "Last Results",
-        ]
+        ],
+        horizontal=True,
+        key="search_workflow",
     )
-    with tab_crop:
+    if search_mode == "Crop Image Search":
         crop_search_tab(project, config)
         run_pending_db_neighbor_search(project, config)
         render_db_neighbor_results("crop")
         render_preview_image("crop_preview")
-    with tab_video:
+    elif search_mode == "Video Detection Search":
         video_detection_tab(project, config)
         render_preview_image("video_preview")
-    with tab_cluster:
+    elif search_mode == "Feature Clustering":
         feature_cluster_tab(project, config)
-    with tab_curation:
+    elif search_mode == "Curation Report":
         curation_report_tab(project, config)
-    with tab_calibration:
+    elif search_mode == "Calibration":
         calibration_tab(project, config)
-    with tab_last:
+    elif search_mode == "Last Results":
         query = st.session_state.get("last_query_image")
         if query is not None:
             st.image(query, caption="Last query", width=260)
