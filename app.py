@@ -780,6 +780,7 @@ def clear_db_neighbor_state() -> None:
     st.session_state["pending_db_neighbor_top_k"] = 20
     st.session_state["db_neighbor_results"] = []
     st.session_state["db_neighbor_query_record"] = None
+    st.session_state["db_neighbor_query_image"] = None
     st.session_state["db_neighbor_error"] = ""
 
 
@@ -1034,6 +1035,205 @@ def render_full_width_image(image: Image.Image, caption: str = "") -> None:
         st.image(image, caption=caption, use_column_width=True)
 
 
+def fit_image_to_square(
+    image: Image.Image,
+    size: int,
+    bg: tuple = (6, 20, 34),
+    padding: int = 8,
+) -> Image.Image:
+    frame = Image.new("RGB", (int(size), int(size)), bg)
+    try:
+        rgb = image.convert("RGB")
+        longest = max(1, rgb.width, rgb.height)
+        target = max(1, int(size) - int(padding) * 2)
+        scale = target / float(longest)
+        resampling = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.BICUBIC)
+        resized = rgb.resize(
+            (max(1, int(round(rgb.width * scale))), max(1, int(round(rgb.height * scale)))),
+            resampling,
+        )
+        frame.paste(resized, ((int(size) - resized.width) // 2, (int(size) - resized.height) // 2))
+    except Exception:
+        draw = ImageDraw.Draw(frame)
+        draw.rectangle((0, 0, int(size) - 1, int(size) - 1), outline=(80, 106, 136), width=2)
+        draw.text((16, int(size) // 2 - 8), "image load failed", fill=(226, 232, 240), font=sheet_font(13))
+    return frame
+
+
+def draw_search_tile(
+    canvas: Image.Image,
+    draw: ImageDraw.ImageDraw,
+    image: Image.Image,
+    x: int,
+    y: int,
+    size: int,
+    outline: tuple,
+    tag: str,
+    line1: str,
+    line2: str,
+) -> None:
+    crop = fit_image_to_square(image, size=size, bg=(6, 20, 34), padding=8)
+    canvas.paste(crop, (x, y))
+    draw.rounded_rectangle((x - 3, y - 3, x + size + 3, y + size + 3), radius=10, outline=outline, width=4)
+    draw.rounded_rectangle((x + 8, y + 8, x + 104, y + 34), radius=8, fill=(6, 20, 34), outline=outline)
+    draw.text((x + 16, y + 13), str(tag)[:14], fill=(248, 250, 252), font=sheet_font(13, bold=True))
+    draw_sheet_label(draw, (x, y + size + 12), line1, sheet_font(14, bold=True), (226, 232, 240), 32)
+    draw_sheet_label(draw, (x, y + size + 34), line2, sheet_font(12), (156, 199, 232), 34)
+
+
+def search_evidence_signature(query_image: Image.Image, results: List[Dict], max_results: int) -> str:
+    parts = [str(id(query_image)), f"{query_image.size[0]}x{query_image.size[1]}"]
+    for item in results[: int(max_results)]:
+        record = item["record"]
+        parts.extend(
+            [
+                str(record.record_id),
+                str(record.image_path),
+                ",".join(str(int(v)) for v in record.bbox_xyxy),
+                f"{float(item.get('score', 0.0)):.5f}",
+                str(file_mtime_ns(record.image_path)),
+            ]
+        )
+    return "|".join(parts)
+
+
+def build_search_evidence_board(
+    query_image: Image.Image,
+    results: List[Dict],
+    max_results: int = 8,
+) -> Optional[Image.Image]:
+    if query_image is None or not results:
+        return None
+
+    top_results = results[: max(1, min(int(max_results), len(results)))]
+    width = 1520
+    header_h = 88
+    query_size = 224
+    result_size = 154
+    cell_w = 272
+    cell_h = 224
+    cols = 4
+    rows = int(np.ceil(len(top_results) / cols))
+    height = max(520, header_h + 34 + rows * cell_h + 46)
+    canvas = Image.new("RGB", (width, height), (7, 17, 31))
+    draw = ImageDraw.Draw(canvas)
+    title_font = sheet_font(27, bold=True)
+    body_font = sheet_font(16)
+    small_font = sheet_font(12)
+
+    draw.text((30, 22), "Search Evidence Board", fill=(248, 250, 252), font=title_font)
+    draw.text(
+        (30, 60),
+        "Query false-positive crop is compared with nearest DB crops from the same YOLO feature space.",
+        fill=(156, 199, 232),
+        font=body_font,
+    )
+    draw.line((26, header_h - 8, width - 26, header_h - 8), fill=(29, 58, 87), width=2)
+
+    query_x = 46
+    query_y = header_h + max(18, (height - header_h - query_size - 54) // 2)
+    draw_search_tile(
+        canvas,
+        draw,
+        query_image,
+        query_x,
+        query_y,
+        query_size,
+        (125, 211, 252),
+        "QUERY",
+        "false-positive crop",
+        f"size={query_image.size[0]}x{query_image.size[1]}",
+    )
+    query_center = (query_x + query_size + 5, query_y + query_size // 2)
+
+    start_x = 378
+    start_y = header_h + 28
+    for idx, item in enumerate(top_results):
+        record = item["record"]
+        col = idx % cols
+        row = idx // cols
+        x = start_x + col * cell_w
+        y = start_y + row * cell_h
+        score = safe_float(item.get("score", 0.0), 0.0)
+        outline = (52, 211, 153) if idx == 0 else (56, 189, 248)
+        if score >= 0.98:
+            outline = (52, 211, 153)
+        elif score < 0.90:
+            outline = (251, 191, 36)
+        try:
+            crop = crop_from_record(record)
+        except Exception:
+            crop = Image.new("RGB", (result_size, result_size), (6, 20, 34))
+            failed_draw = ImageDraw.Draw(crop)
+            failed_draw.text((14, result_size // 2 - 8), "crop load failed", fill=(226, 232, 240), font=small_font)
+
+        target_center = (x - 5, y + result_size // 2)
+        draw.line((query_center[0], query_center[1], target_center[0], target_center[1]), fill=outline, width=3)
+        label_x = int((query_center[0] + target_center[0]) / 2) - 24
+        label_y = int((query_center[1] + target_center[1]) / 2) - 12
+        draw.rounded_rectangle((label_x - 6, label_y - 3, label_x + 70, label_y + 21), radius=7, fill=(6, 20, 34), outline=outline)
+        draw.text((label_x, label_y), f"{score:.3f}", fill=(248, 250, 252), font=small_font)
+
+        file_name = Path(record.image_path).name
+        draw_search_tile(
+            canvas,
+            draw,
+            crop,
+            x,
+            y,
+            result_size,
+            outline,
+            f"#{item['rank']} {score:.3f}",
+            f"{record.class_id} {record.class_name}",
+            file_name,
+        )
+
+    draw.text(
+        (30, height - 29),
+        "Similarity is feature-space nearest-neighbor evidence, not a calibrated detection probability.",
+        fill=(148, 163, 184),
+        font=small_font,
+    )
+    return canvas
+
+
+def render_search_evidence_board(
+    results: List[Dict],
+    key_prefix: str,
+    query_image: Optional[Image.Image] = None,
+    max_results: int = 8,
+) -> None:
+    query = query_image or st.session_state.get("last_query_image")
+    if query is None or not results:
+        return
+
+    cache = st.session_state.setdefault("search_evidence_board_cache", {})
+    if len(cache) > 12:
+        cache.clear()
+    signature = search_evidence_signature(query, results, max_results=max_results)
+    cache_key = signature
+    board = cache.get(cache_key)
+    if board is None:
+        with st.spinner("Building search evidence board..."):
+            board = build_search_evidence_board(query, results, max_results=max_results)
+        if board is not None:
+            cache[cache_key] = board
+
+    if board is None:
+        return
+
+    st.subheader("Search Evidence Board")
+    render_full_width_image(board, caption="Query crop vs nearest DB feature neighbors")
+    st.download_button(
+        "Download Evidence Board PNG",
+        image_to_png_bytes(board),
+        file_name=f"{key_prefix}_search_evidence_board.png",
+        mime="image/png",
+        key=f"{key_prefix}_download_search_evidence_board",
+        use_container_width=True,
+    )
+
+
 def result_rows(results: List[Dict]) -> pd.DataFrame:
     rows = []
     for item in results:
@@ -1097,10 +1297,17 @@ def detection_group_name(det: Detection, group_mode: str) -> str:
     return "All crops"
 
 
-def show_results(results: List[Dict], columns: int = 4, key_prefix: str = "results") -> None:
+def show_results(
+    results: List[Dict],
+    columns: int = 4,
+    key_prefix: str = "results",
+    query_image: Optional[Image.Image] = None,
+) -> None:
     if not results:
         st.info("검색 결과가 없습니다.")
         return
+
+    render_search_evidence_board(results, key_prefix=key_prefix, query_image=query_image)
 
     full_df = result_rows(results)
     display_df = result_display_rows(results)
@@ -1265,6 +1472,10 @@ def run_pending_db_neighbor_search(project: Dict, config: Dict) -> None:
             results = index.search_record(record, top_k=top_k, exclude_self=True)
         st.session_state["db_neighbor_results"] = results
         st.session_state["db_neighbor_query_record"] = payload
+        try:
+            st.session_state["db_neighbor_query_image"] = crop_from_record(record)
+        except Exception:
+            st.session_state["db_neighbor_query_image"] = None
         st.session_state["db_neighbor_error"] = ""
         st.session_state["db_neighbor_elapsed"] = format_duration(time.time() - start)
     except Exception as exc:
@@ -1295,6 +1506,7 @@ def render_db_neighbor_results(render_key_prefix: str = "db_neighbor") -> None:
     show_results(
         results,
         key_prefix=f"{render_key_prefix}_db_neighbor_results_{payload.get('record_id', 'unknown')}",
+        query_image=st.session_state.get("db_neighbor_query_image"),
     )
 
 
@@ -5345,6 +5557,109 @@ def render_reduction_evidence_wall(plan_dir: Path, groups: pd.DataFrame, members
     )
 
 
+def render_reduction_decision_board(plan_dir: Path, groups: pd.DataFrame, members: pd.DataFrame) -> None:
+    st.subheader("Reduction Decision Board")
+    if groups.empty or members.empty:
+        st.caption("No reduction groups available.")
+        return
+
+    board_classes = ["All"] + sorted(groups["class_name"].dropna().astype(str).unique().tolist())
+    ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([1.2, 1.4, 0.8, 0.8, 1.2])
+    with ctrl1:
+        board_class = st.selectbox("Board class", board_classes, key="reduction_overview_board_class")
+    with ctrl2:
+        board_sort = st.selectbox(
+            "Board mode",
+            ["One Top Group Per Class", "Largest Drop Groups", "Largest Group", "Highest Similarity"],
+            index=0,
+            key="reduction_overview_board_sort",
+        )
+    with ctrl3:
+        board_rows = st.number_input(
+            "Rows",
+            min_value=2,
+            max_value=10,
+            value=5,
+            step=1,
+            key="reduction_overview_board_rows",
+        )
+    with ctrl4:
+        board_samples = st.number_input(
+            "Samples",
+            min_value=2,
+            max_value=6,
+            value=4,
+            step=1,
+            key="reduction_overview_board_samples",
+        )
+    with ctrl5:
+        build_board = st.button(
+            "Generate Board",
+            key="btn_generate_reduction_decision_board",
+            use_container_width=True,
+        )
+
+    board_groups = select_reduction_board_groups(
+        groups,
+        class_filter=str(board_class),
+        sort_mode=str(board_sort),
+        max_groups=max(int(board_rows) * 4, int(board_rows)),
+    ).head(int(board_rows))
+    if board_groups.empty:
+        st.warning("No groups match the board filters.")
+        return
+
+    board_path = reduction_evidence_wall_path(
+        plan_dir,
+        class_filter=f"overview_{board_class}",
+        sort_mode=f"decision_{board_sort}",
+        rows=int(board_rows),
+        samples=int(board_samples),
+        protected_only=False,
+    )
+
+    meta_col1, meta_col2, meta_col3 = st.columns(3)
+    with meta_col1:
+        st.metric("Board groups", f"{len(board_groups):,}")
+    with meta_col2:
+        st.metric("Drop candidates in board", f"{int(board_groups.get('drop_candidates', pd.Series(dtype=int)).map(lambda value: safe_int(value, 0)).sum()):,}")
+    with meta_col3:
+        st.metric("Mean similarity", f"{float(board_groups.get('mean_similarity_to_primary', pd.Series(dtype=float)).map(lambda value: safe_float(value, 0.0)).mean()):.4f}")
+
+    if build_board:
+        with st.spinner("Loading representative/drop crops and writing board PNG..."):
+            board = build_reduction_sample_board(
+                board_groups,
+                members,
+                max_groups=int(board_rows),
+                samples_per_group=int(board_samples),
+            )
+        if board is None:
+            st.warning("Could not build the decision board.")
+        else:
+            board_path.parent.mkdir(parents=True, exist_ok=True)
+            board.save(board_path)
+            st.success(f"Decision board generated: {board_path}")
+
+    if board_path.exists():
+        try:
+            with Image.open(board_path) as board_file:
+                board_image = board_file.convert("RGB").copy()
+            render_full_width_image(board_image, caption=f"Reduction Decision Board | {board_sort} | class={board_class}")
+            st.download_button(
+                "Download Board PNG",
+                board_path.read_bytes(),
+                file_name=board_path.name,
+                mime="image/png",
+                key=f"reduction_decision_board_png_{slugify(str(board_class))}_{slugify(str(board_sort))}_{int(board_rows)}_{int(board_samples)}",
+                use_container_width=True,
+            )
+        except Exception as exc:
+            st.warning(f"Cached decision board load failed: {exc}")
+    else:
+        st.caption("Generate the board once to cache the visual proof image inside the reduction plan folder.")
+
+
 def reduction_action_group(action: Any) -> str:
     action_text = str(action or "").upper()
     if action_text.startswith("DROP"):
@@ -6279,6 +6594,7 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
                 st.metric("Largest group", "0")
 
         render_reduction_flow_chart(summary)
+        render_reduction_decision_board(plan_dir, groups, members)
 
         if not groups.empty and not members.empty:
             class_summary = members.copy()
