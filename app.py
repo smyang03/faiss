@@ -5535,6 +5535,122 @@ def render_reduction_flow_chart(summary: Dict) -> None:
     st.plotly_chart(fig, use_container_width=True, key="reduction_flow_sankey")
 
 
+def render_reduction_decision_criteria(
+    summary: Dict,
+    members: pd.DataFrame,
+    drops: pd.DataFrame,
+    user_keep_count: int,
+) -> None:
+    st.subheader("Decision Criteria")
+    tight_threshold = float(summary.get("tight_threshold", 0.0) or 0.0)
+    protect_threshold = float(summary.get("protect_cross_class_threshold", 0.0) or 0.0)
+    planned = int(summary.get("planned_records", 0) or 0)
+    effective_drop_records = int(effective_drop_mask(drops).sum()) if not drops.empty else 0
+    natural_reduction = effective_drop_records / max(1, planned) * 100.0
+
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.metric("Tight sim threshold", f"{tight_threshold:.3f}")
+    with k2:
+        st.metric("Cross-class protect", f"{protect_threshold:.3f}")
+    with k3:
+        st.metric("Effective reduction", f"{natural_reduction:.2f}%")
+    with k4:
+        st.metric("User keeps", f"{int(user_keep_count):,}")
+
+    criteria_rows = [
+        {
+            "case": "Same class + same size + tight feature similarity",
+            "default_action": "Drop candidate",
+            "review_focus": "Keep only if the crop has unique condition, rare angle, hard lighting, or annotation value.",
+        },
+        {
+            "case": "Representative / medoid sample",
+            "default_action": "Keep",
+            "review_focus": "This sample represents the local group and should remain unless the label is wrong.",
+        },
+        {
+            "case": "High similarity across different classes",
+            "default_action": "Protected keep",
+            "review_focus": "Keep because it is useful for class-boundary learning and confusion analysis.",
+        },
+        {
+            "case": "User Keep override",
+            "default_action": "Keep in export",
+            "review_focus": "Manual decision wins over automatic reduction and is written to reduction_keep_overrides.json.",
+        },
+    ]
+    st.dataframe(pd.DataFrame(criteria_rows), use_container_width=True, hide_index=True, height=180, key="reduction_decision_criteria_table")
+
+    if not members.empty and "similarity_to_primary" in members.columns:
+        work = members.copy()
+        work["_sim"] = work["similarity_to_primary"].map(lambda value: safe_float(value, 0.0))
+        work = work[work["_sim"] > 0].copy()
+        if not work.empty:
+            quantiles = work["_sim"].quantile([0.0, 0.25, 0.5, 0.75, 1.0]).to_dict()
+            st.caption(
+                "Similarity range: "
+                f"min={quantiles.get(0.0, 0):.4f} | "
+                f"q25={quantiles.get(0.25, 0):.4f} | "
+                f"median={quantiles.get(0.5, 0):.4f} | "
+                f"q75={quantiles.get(0.75, 0):.4f} | "
+                f"max={quantiles.get(1.0, 0):.4f}"
+            )
+
+
+def render_reduction_similarity_distribution(members: pd.DataFrame, summary: Dict) -> None:
+    if members.empty or "similarity_to_primary" not in members.columns:
+        return
+    work = members.copy()
+    work["_sim"] = work["similarity_to_primary"].map(lambda value: safe_float(value, 0.0))
+    work = work[work["_sim"] > 0].copy()
+    if work.empty:
+        return
+    work["_action_group"] = work["action"].map(reduction_action_group)
+    min_sim = max(0.0, float(work["_sim"].min()) - 0.001)
+    bins = np.linspace(min_sim, 1.0, 42)
+    centers = (bins[:-1] + bins[1:]) / 2.0
+    fig = go.Figure()
+    for action_group, sub in work.groupby("_action_group"):
+        values = sub["_sim"].to_numpy(dtype=np.float32)
+        counts, _ = np.histogram(values, bins=bins)
+        fig.add_bar(x=centers, y=counts, name=str(action_group), width=float((bins[1] - bins[0]) * 0.85))
+    tight_threshold = float(summary.get("tight_threshold", 0.0) or 0.0)
+    if tight_threshold > 0:
+        fig.add_shape(
+            type="line",
+            x0=tight_threshold,
+            x1=tight_threshold,
+            y0=0,
+            y1=1,
+            yref="paper",
+            line=dict(color="#facc15", width=2, dash="dash"),
+        )
+        fig.add_annotation(
+            x=tight_threshold,
+            y=1,
+            yref="paper",
+            text=f"threshold {tight_threshold:.3f}",
+            showarrow=False,
+            xanchor="left",
+            font=dict(color="#fde68a", size=12),
+        )
+    fig.update_layout(
+        title="Similarity Distribution By Review Action",
+        barmode="overlay",
+        height=330,
+        margin=dict(l=20, r=20, t=50, b=45),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#e5f3ff"),
+        legend=dict(orientation="h"),
+        xaxis_title="similarity to representative",
+        yaxis_title="records",
+    )
+    fig.update_traces(opacity=0.72)
+    st.plotly_chart(fig, use_container_width=True, key="reduction_similarity_distribution")
+
+
 def image_to_png_bytes(image: Image.Image) -> bytes:
     buffer = io.BytesIO()
     image.save(buffer, format="PNG")
@@ -5700,14 +5816,14 @@ def render_reduction_evidence_wall(plan_dir: Path, groups: pd.DataFrame, members
     )
 
 
-def render_reduction_decision_board(plan_dir: Path, groups: pd.DataFrame, members: pd.DataFrame) -> None:
-    st.subheader("Reduction Decision Board")
+def render_reduction_decision_board(plan_dir: Path, groups: pd.DataFrame, members: pd.DataFrame, summary: Optional[Dict] = None) -> None:
+    st.subheader("Multi Group Review Board")
     if groups.empty or members.empty:
         st.caption("No reduction groups available.")
         return
 
     board_classes = ["All"] + sorted(groups["class_name"].dropna().astype(str).unique().tolist())
-    ctrl1, ctrl2, ctrl3, ctrl4, ctrl5 = st.columns([1.2, 1.4, 0.8, 0.8, 1.2])
+    ctrl1, ctrl2, ctrl3, ctrl4, ctrl5, ctrl6 = st.columns([1.1, 1.35, 0.75, 0.75, 1.0, 1.1])
     with ctrl1:
         board_class = st.selectbox("Board class", board_classes, key="reduction_overview_board_class")
     with ctrl2:
@@ -5736,6 +5852,17 @@ def render_reduction_decision_board(plan_dir: Path, groups: pd.DataFrame, member
             key="reduction_overview_board_samples",
         )
     with ctrl5:
+        default_min_sim = float((summary or {}).get("tight_threshold", 0.0) or 0.0)
+        board_min_mean_sim = st.slider(
+            "Min mean sim",
+            min_value=0.0,
+            max_value=1.0,
+            value=min(1.0, max(0.0, default_min_sim)),
+            step=0.001,
+            format="%.3f",
+            key="reduction_overview_board_min_mean_sim",
+        )
+    with ctrl6:
         build_board = st.button(
             "Generate Board",
             key="btn_generate_reduction_decision_board",
@@ -5747,7 +5874,12 @@ def render_reduction_decision_board(plan_dir: Path, groups: pd.DataFrame, member
         class_filter=str(board_class),
         sort_mode=str(board_sort),
         max_groups=max(int(board_rows) * 4, int(board_rows)),
-    ).head(int(board_rows))
+    )
+    if board_min_mean_sim > 0 and "mean_similarity_to_primary" in board_groups.columns:
+        board_groups = board_groups[
+            board_groups["mean_similarity_to_primary"].map(lambda value: safe_float(value, 0.0)) >= float(board_min_mean_sim)
+        ].copy()
+    board_groups = board_groups.head(int(board_rows))
     if board_groups.empty:
         st.warning("No groups match the board filters.")
         return
@@ -5755,7 +5887,7 @@ def render_reduction_decision_board(plan_dir: Path, groups: pd.DataFrame, member
     board_path = reduction_evidence_wall_path(
         plan_dir,
         class_filter=f"overview_{board_class}",
-        sort_mode=f"decision_{board_sort}",
+        sort_mode=f"decision_{board_sort}_min{float(board_min_mean_sim):.3f}",
         rows=int(board_rows),
         samples=int(board_samples),
         protected_only=False,
@@ -6764,8 +6896,10 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
             else:
                 st.metric("Largest group", "0")
 
+        render_reduction_decision_criteria(summary, members, drops, valid_override_count)
         render_reduction_flow_chart(summary)
-        render_reduction_decision_board(plan_dir, groups, members)
+        render_reduction_similarity_distribution(members, summary)
+        render_reduction_decision_board(plan_dir, groups, members, summary)
 
         if not groups.empty and not members.empty:
             class_summary = members.copy()
