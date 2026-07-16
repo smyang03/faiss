@@ -496,29 +496,6 @@ def apply_theme() -> None:
             margin: 2px 0 8px 0;
             overflow-wrap: anywhere;
         }
-        .fo-topbar {
-            border: 1px solid #1b3855;
-            border-radius: 8px;
-            background: #081827;
-            padding: 9px 12px;
-            margin: 6px 0 12px 0;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-        }
-        .fo-topbar-title {
-            color: #f8fafc !important;
-            font-size: 15px;
-            font-weight: 700;
-            line-height: 1.2;
-        }
-        .fo-topbar-meta {
-            color: #9cc7e8 !important;
-            font-size: 12px;
-            line-height: 1.2;
-            text-align: right;
-        }
         .fo-pane-title {
             color: #f8fafc !important;
             font-size: 13px;
@@ -647,8 +624,6 @@ def init_state() -> None:
         "reduction_embedding_result": None,
         "reduction_embedding_request": None,
         "reduction_embedding_selected": None,
-        "fiftyone_launcher_pid": None,
-        "fiftyone_launcher_log": "",
         "calibration_request": None,
         "calibration_result": None,
         "calibration_result_request": None,
@@ -5567,7 +5542,7 @@ def render_reduction_record_inspector(
 def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, members: pd.DataFrame) -> None:
     del plan_dir
     st.caption(
-        "FiftyOne-style review: filter the complex dataset on the left, inspect bbox crops in the center, "
+        "Dataset review: filter records on the left, inspect bbox crops in the center, "
         "and use the right panel as the active sample inspector."
     )
     frame = prepare_reduction_explorer_frame(groups, members)
@@ -6063,208 +6038,6 @@ def render_reduction_embedding_explorer(plan_dir: Path, groups: pd.DataFrame, me
     render_preview_image("reduction_embedding_preview")
 
 
-def tail_file_chars(path: Path, max_chars: int = 6000) -> str:
-    if not path.exists():
-        return ""
-    try:
-        data = path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return ""
-    return data[-int(max_chars):]
-
-
-def check_fiftyone_runtime(timeout_sec: int = 120) -> Dict:
-    code = "import fiftyone as fo; print(fo.__version__)"
-    started = time.time()
-    try:
-        result = subprocess.run(
-            [sys.executable, "-c", code],
-            cwd=str(Path.cwd()),
-            capture_output=True,
-            text=True,
-            timeout=int(timeout_sec),
-        )
-        return {
-            "ok": result.returncode == 0,
-            "stdout": (result.stdout or "").strip(),
-            "stderr": (result.stderr or "").strip(),
-            "elapsed": time.time() - started,
-        }
-    except subprocess.TimeoutExpired as exc:
-        return {
-            "ok": False,
-            "stdout": exc.stdout or "",
-            "stderr": f"FiftyOne runtime check timed out after {timeout_sec}s",
-            "elapsed": time.time() - started,
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "stdout": "",
-            "stderr": f"{type(exc).__name__}: {exc}",
-            "elapsed": time.time() - started,
-        }
-
-
-def fiftyone_lock_status() -> Dict:
-    lock_path = Path("artifacts") / "fiftyone_exports" / "fiftyone_export.lock"
-    if not lock_path.exists():
-        return {"locked": False, "path": str(lock_path), "pid": None, "running": False}
-    try:
-        payload = json.loads(lock_path.read_text(encoding="utf-8"))
-    except Exception:
-        payload = {}
-    pid = safe_int(payload.get("pid", -1), -1)
-    return {
-        "locked": True,
-        "path": str(lock_path),
-        "pid": pid if pid > 0 else None,
-        "running": bool(pid > 0 and pid_is_running(pid)),
-        "payload": payload,
-    }
-
-
-def render_fiftyone_native_launcher(plan_dir: Path, summary: Dict) -> None:
-    st.caption(
-        "Native FiftyOne keeps this project's YOLO feature/search/reduction pipeline unchanged, "
-        "but opens the resulting crop records in the actual FiftyOne App UI."
-    )
-    st.markdown(
-        """
-        <div class="fo-topbar">
-          <div>
-            <div class="fo-topbar-title">FiftyOne Native Viewer</div>
-            <div class="explorer-status-line">Use this when you want the real FiftyOne sample grid, field sidebar, sample modal, and embeddings panel.</div>
-          </div>
-          <div class="fo-topbar-meta">source: reduction_group_members.csv<br>features: existing YOLO feature index</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    dataset_default = f"reduction_{slugify(str(plan_dir.parent.name))}_{slugify(str(plan_dir.name))}"
-    ctrl1, ctrl2, ctrl3, ctrl4 = st.columns(4)
-    with ctrl1:
-        dataset_name = st.text_input("FiftyOne dataset", value=dataset_default, key="fiftyone_dataset_name")
-        action_filter = st.selectbox(
-            "FiftyOne export scope",
-            ["All", "Drop candidates", "Representatives", "Protected keeps", "Other keeps"],
-            key="fiftyone_action_filter",
-        )
-    with ctrl2:
-        max_records = st.number_input(
-            "Max records",
-            min_value=0,
-            max_value=500000,
-            value=5000,
-            step=1000,
-            key="fiftyone_max_records",
-            help="0 exports all records. Start with 5k-20k for a responsive first native UI check.",
-        )
-        port = st.number_input("FiftyOne port", min_value=1024, max_value=65535, value=5151, step=1, key="fiftyone_port")
-    with ctrl3:
-        include_embeddings = st.checkbox(
-            "Attach YOLO vectors",
-            value=False,
-            key="fiftyone_include_embeddings",
-            help="Stores the existing 1792-d YOLO feature vector on each FiftyOne sample. This can be large.",
-        )
-        compute_visualization = st.checkbox(
-            "Compute embedding panel",
-            value=True,
-            key="fiftyone_compute_visualization",
-            help="Computes a FiftyOne Brain visualization from the existing YOLO feature vectors.",
-        )
-    with ctrl4:
-        visualization_method = st.selectbox("Visualization", ["pca", "umap", "tsne"], index=0, key="fiftyone_visualization_method")
-        overwrite = st.checkbox("Overwrite dataset", value=True, key="fiftyone_overwrite_dataset")
-
-    lock_status = fiftyone_lock_status()
-    if lock_status.get("locked"):
-        if lock_status.get("running"):
-            st.warning(f"FiftyOne export/launcher is already running: PID {lock_status.get('pid')}")
-        else:
-            st.warning(f"Stale FiftyOne lock detected: {lock_status.get('path')}. The launcher will clear it automatically.")
-
-    command = [
-        sys.executable,
-        str(Path("scripts") / "export_reduction_to_fiftyone.py"),
-        "--plan-dir",
-        str(plan_dir),
-        "--dataset-name",
-        str(dataset_name),
-        "--max-records",
-        str(int(max_records)),
-        "--action-filter",
-        str(action_filter),
-        "--port",
-        str(int(port)),
-        "--launch",
-        "--wait",
-    ]
-    if include_embeddings:
-        command.append("--include-embeddings")
-    if compute_visualization:
-        command.extend(["--compute-visualization", "--visualization-method", str(visualization_method)])
-    if overwrite:
-        command.append("--overwrite")
-
-    check_col, launch_col, link_col = st.columns([1, 1, 2])
-    with check_col:
-        if st.button("Check FiftyOne Runtime", key="btn_check_fiftyone_runtime", use_container_width=True):
-            with st.spinner("Checking FiftyOne import/runtime..."):
-                st.session_state["fiftyone_runtime_check"] = check_fiftyone_runtime()
-    with launch_col:
-        launch_disabled = bool(lock_status.get("locked") and lock_status.get("running"))
-        if st.button(
-            "Launch Native FiftyOne",
-            type="primary",
-            key="btn_launch_fiftyone_native",
-            use_container_width=True,
-            disabled=launch_disabled,
-        ):
-            log_dir = Path("artifacts") / "fiftyone_exports" / "logs"
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_path = log_dir / f"{slugify(str(dataset_name))}_{datetime.now():%Y%m%d_%H%M%S}.log"
-            stdout = log_path.open("w", encoding="utf-8")
-            proc = subprocess.Popen(
-                command,
-                cwd=str(Path.cwd()),
-                stdout=stdout,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            stdout.close()
-            st.session_state["fiftyone_launcher_pid"] = int(proc.pid)
-            st.session_state["fiftyone_launcher_log"] = str(log_path)
-            st.success(f"FiftyOne launcher started: PID {proc.pid}")
-    with link_col:
-        st.markdown(f"[Open FiftyOne App](http://localhost:{int(port)})")
-        st.caption("If the page is not ready yet, wait until the launcher log says `FiftyOne App:`.")
-
-    runtime_check = st.session_state.get("fiftyone_runtime_check")
-    if runtime_check:
-        if runtime_check.get("ok"):
-            st.success(f"FiftyOne runtime OK: {runtime_check.get('stdout')} | {format_duration(runtime_check.get('elapsed', 0.0))}")
-        else:
-            st.error("FiftyOne runtime is not ready.")
-            st.code((runtime_check.get("stderr") or runtime_check.get("stdout") or "").strip(), language="text")
-            st.caption(
-                "This does not affect the existing Streamlit/FAISS pipeline. It only blocks the native FiftyOne viewer."
-            )
-
-    st.text_area(
-        "Launcher command",
-        value=" ".join(f'"{part}"' if " " in str(part) else str(part) for part in command),
-        height=92,
-        key="fiftyone_launcher_command",
-    )
-    log_path_text = st.session_state.get("fiftyone_launcher_log", "")
-    if log_path_text:
-        log_path = Path(log_path_text)
-        st.caption(f"launcher log: {log_path} | PID={st.session_state.get('fiftyone_launcher_pid')}")
-        st.text_area("Launcher log tail", value=tail_file_chars(log_path), height=240, key="fiftyone_launcher_log_tail")
-
-
 def render_reduction_visual_review(plan_dir: Path) -> None:
     st.subheader("Visual Review")
     st.caption("Inspect the removed candidates before using the manifest/copy export. Cards show bbox crops, not full images.")
@@ -6290,7 +6063,6 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
         "Overview",
         "Dataset Explorer",
         "Embedding Explorer",
-        "FiftyOne Native",
         "Evidence Wall",
         "Evidence Detail",
         "Drop Gallery",
@@ -6441,9 +6213,6 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
 
     if review_mode == "Embedding Explorer":
         render_reduction_embedding_explorer(plan_dir, groups, members, summary)
-
-    if review_mode == "FiftyOne Native":
-        render_fiftyone_native_launcher(plan_dir, summary)
 
     if review_mode == "Evidence Wall":
         render_reduction_evidence_wall(plan_dir, groups, members)
