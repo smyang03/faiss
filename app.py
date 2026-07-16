@@ -414,6 +414,25 @@ def apply_theme() -> None:
             max-width: 260px;
             margin-top: 0;
         }
+        .reduction-tile-meta {
+            min-height: 46px;
+            margin: 2px 0 6px 0;
+            color: #9cc7e8 !important;
+            font-size: 11px;
+            line-height: 1.22;
+            overflow: hidden;
+            overflow-wrap: anywhere;
+        }
+        .reduction-tile-meta strong {
+            color: #f8fafc !important;
+            font-size: 12px;
+            font-weight: 700;
+        }
+        .reduction-tile .thumb-img-frame {
+            max-width: 260px;
+            margin: 0 auto 6px auto;
+            border-color: #24435f;
+        }
         .query-preview-title {
             color: #f8fafc !important;
             font-size: 13px;
@@ -4518,25 +4537,40 @@ def render_report_csv_preview(report_dir: Path, filename: str, title: str, key_p
         pass
 
 
-def render_reduction_record_card(row, key_prefix: str, title: str, badge: str, compact: bool = True) -> None:
+def render_reduction_record_tile(row, key_prefix: str, badge: str, role: str = "") -> None:
     record = record_from_csv_row(row)
-    meta = f"{record.class_id} {record.class_name} | {Path(record.image_path).name}"
-    if hasattr(row, "similarity_to_primary") and pd.notna(getattr(row, "similarity_to_primary")):
-        meta = f"sim={float(getattr(row, 'similarity_to_primary')):.4f} | {meta}"
-    open_card(title=title, meta=meta, compact=compact)
+    action = str(getattr(row, "action", role or ""))
+    group_id = getattr(row, "reduction_group_id", "")
+    sim = getattr(row, "similarity_to_primary", None)
+    sim_text = f" | sim {safe_float(sim):.4f}" if sim is not None and pd.notna(sim) else ""
+    role_text = role or ("DROP" if action.startswith("DROP") else ("REP" if "REPRESENTATIVE" in action else "KEEP"))
+    file_name = Path(record.image_path).name
+    meta_line = f"G{group_id} | {record.class_id} {record.class_name}{sim_text}"
+
+    st.markdown(
+        f"""
+        <div class="reduction-tile">
+          <div class="reduction-tile-meta">
+            <strong>{html.escape(str(role_text))}</strong><br>
+            {html.escape(meta_line)}<br>
+            {html.escape(file_name)}
+          </div>
+        """,
+        unsafe_allow_html=True,
+    )
     thumb_ok = render_record_thumb(record, badge=badge)
     if not thumb_ok:
         st.caption("crop load failed")
     if thumb_ok and st.button("View", key=f"{key_prefix}_view", use_container_width=True):
         set_preview_image(
             crop_from_record(record),
-            f"{title} | {record.class_id} {record.class_name} | {Path(record.image_path).name}",
+            f"{role_text} | {record.class_id} {record.class_name} | {file_name}",
         )
         st.rerun()
     if st.button("Data", key=f"{key_prefix}_data", use_container_width=True):
         open_data_location(record.image_path)
     render_path_selector(record.image_path, record, key=f"{key_prefix}_select")
-    close_card()
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 def boolish_series(series: pd.Series) -> pd.Series:
@@ -5354,11 +5388,11 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
                 with cols[pos % 4]:
                     sim = getattr(row, "similarity_to_primary", None)
                     badge = f"DROP {float(sim):.3f}" if sim is not None and pd.notna(sim) else "DROP"
-                    render_reduction_record_card(
+                    render_reduction_record_tile(
                         row,
                         key_prefix=f"reduction_drop_gallery_{pos}_{getattr(row, 'record_idx', pos)}",
-                        title=f"G{getattr(row, 'reduction_group_id', '')} | drop",
                         badge=badge,
+                        role="DROP",
                     )
 
     with review_tab3:
@@ -5397,11 +5431,11 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
         with compare_cols[0]:
             st.markdown("**Representative**")
             for pos, row in enumerate(reps.head(3).itertuples(index=False)):
-                render_reduction_record_card(
+                render_reduction_record_tile(
                     row,
                     key_prefix=f"reduction_group_rep_{selected_group_id}_{pos}_{getattr(row, 'record_idx', pos)}",
-                    title=f"G{selected_group_id} | representative",
                     badge="KEEP REP",
+                    role="REPRESENTATIVE",
                 )
         with compare_cols[1]:
             st.markdown("**Drop / Protected Candidates**")
@@ -5419,11 +5453,11 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
                     action = str(getattr(row, "action", ""))
                     sim = getattr(row, "similarity_to_primary", None)
                     badge = f"{'DROP' if action.startswith('DROP') else 'KEEP'} {float(sim):.3f}" if sim is not None and pd.notna(sim) else action
-                    render_reduction_record_card(
+                    render_reduction_record_tile(
                         row,
                         key_prefix=f"reduction_group_member_{selected_group_id}_{pos}_{getattr(row, 'record_idx', pos)}",
-                        title=f"G{selected_group_id} | {action}",
                         badge=badge,
+                        role="DROP" if action.startswith("DROP") else "PROTECTED",
                     )
 
 
