@@ -433,6 +433,78 @@ def apply_theme() -> None:
             margin: 0 auto 6px auto;
             border-color: #24435f;
         }
+        .explorer-shell {
+            border: 1px solid #1b3855;
+            border-radius: 8px;
+            background: #081827;
+            padding: 10px;
+            margin-bottom: 10px;
+        }
+        .explorer-kpi {
+            border: 1px solid #1d3a57;
+            border-radius: 7px;
+            background: #0a1b2d;
+            padding: 8px 10px;
+            margin-bottom: 8px;
+        }
+        .explorer-kpi strong {
+            display: block;
+            color: #f8fafc !important;
+            font-size: 16px;
+            line-height: 1.15;
+        }
+        .explorer-kpi span {
+            color: #9cc7e8 !important;
+            font-size: 11px;
+        }
+        .explorer-tile {
+            border: 1px solid #1d3a57;
+            border-radius: 8px;
+            background: #0a1b2d;
+            padding: 8px;
+            margin-bottom: 10px;
+            min-height: 368px;
+            overflow: hidden;
+        }
+        .explorer-tile-selected {
+            border-color: #38bdf8;
+            box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.55);
+        }
+        .explorer-tile-meta {
+            min-height: 58px;
+            color: #9cc7e8 !important;
+            font-size: 11px;
+            line-height: 1.22;
+            overflow: hidden;
+            overflow-wrap: anywhere;
+            margin-bottom: 6px;
+        }
+        .explorer-tile-meta strong {
+            color: #f8fafc !important;
+            font-size: 12px;
+        }
+        .explorer-inspector {
+            border: 1px solid #1d3a57;
+            border-radius: 8px;
+            background: #0a1b2d;
+            padding: 10px;
+            min-height: 420px;
+        }
+        .explorer-inspector-title {
+            color: #f8fafc !important;
+            font-size: 15px;
+            font-weight: 700;
+            line-height: 1.25;
+            overflow-wrap: anywhere;
+            margin-bottom: 5px;
+        }
+        .explorer-inspector-meta {
+            color: #9cc7e8 !important;
+            font-size: 12px;
+            line-height: 1.28;
+            overflow-wrap: anywhere;
+            margin-bottom: 8px;
+        }
         .query-preview-title {
             color: #f8fafc !important;
             font-size: 13px;
@@ -521,6 +593,10 @@ def init_state() -> None:
         "cluster_result_request": None,
         "cluster_result_elapsed": 0.0,
         "cluster_compare_points": [],
+        "reduction_explorer_selected": None,
+        "reduction_embedding_result": None,
+        "reduction_embedding_request": None,
+        "reduction_embedding_selected": None,
         "calibration_request": None,
         "calibration_result": None,
         "calibration_result_request": None,
@@ -5187,6 +5263,720 @@ def render_reduction_evidence_wall(plan_dir: Path, groups: pd.DataFrame, members
     )
 
 
+def reduction_action_group(action: Any) -> str:
+    action_text = str(action or "").upper()
+    if action_text.startswith("DROP"):
+        return "Drop candidates"
+    if "REPRESENTATIVE" in action_text:
+        return "Representatives"
+    if "PROTECTED" in action_text:
+        return "Protected keeps"
+    return "Other keeps"
+
+
+def prepare_reduction_explorer_frame(groups: pd.DataFrame, members: pd.DataFrame) -> pd.DataFrame:
+    if members.empty:
+        return members.copy()
+    frame = members.copy()
+    if "record_idx" not in frame.columns:
+        frame["record_idx"] = frame.get("record_id", pd.Series(range(len(frame)), index=frame.index))
+    if "file_name" not in frame.columns:
+        frame["file_name"] = frame.get("image_path", "").astype(str).map(lambda value: Path(value).name)
+    if "action" not in frame.columns:
+        frame["action"] = ""
+    if "size_bucket" not in frame.columns:
+        frame["size_bucket"] = ""
+    if "similarity_to_primary" not in frame.columns:
+        frame["similarity_to_primary"] = np.nan
+    if "is_representative" not in frame.columns:
+        frame["is_representative"] = frame["action"].astype(str).str.contains("REPRESENTATIVE", regex=False)
+    if "is_protected" not in frame.columns:
+        frame["is_protected"] = frame["action"].astype(str).str.contains("PROTECTED", regex=False)
+
+    frame["_record_idx_int"] = frame["record_idx"].map(lambda value: safe_int(value, -1)).astype(int)
+    frame["_group_id_int"] = frame.get("reduction_group_id", -1).map(lambda value: safe_int(value, -1)).astype(int)
+    frame["_sim"] = pd.to_numeric(frame["similarity_to_primary"], errors="coerce").fillna(0.0).astype(float)
+    frame["_is_drop"] = frame["action"].astype(str).str.startswith("DROP")
+    frame["_is_rep"] = boolish_series(frame["is_representative"])
+    frame["_is_protected"] = boolish_series(frame["is_protected"])
+    frame["_action_group"] = frame["action"].map(reduction_action_group)
+    frame["_file_name"] = frame["file_name"].astype(str)
+    frame["_class_label"] = frame["class_id"].astype(str) + " " + frame["class_name"].astype(str)
+    frame["_group_size"] = 0
+    frame["_group_drop_candidates"] = 0
+    frame["_group_mean_sim"] = 0.0
+
+    if not groups.empty and "reduction_group_id" in groups.columns:
+        group_frame = groups.copy()
+        group_frame["_group_id_int"] = group_frame["reduction_group_id"].map(lambda value: safe_int(value, -1)).astype(int)
+        if "group_size" in group_frame.columns:
+            group_sizes = group_frame.set_index("_group_id_int")["group_size"].map(lambda value: safe_int(value, 0)).to_dict()
+            frame["_group_size"] = frame["_group_id_int"].map(group_sizes).fillna(0).astype(int)
+        if "drop_candidates" in group_frame.columns:
+            group_drops = group_frame.set_index("_group_id_int")["drop_candidates"].map(lambda value: safe_int(value, 0)).to_dict()
+            frame["_group_drop_candidates"] = frame["_group_id_int"].map(group_drops).fillna(0).astype(int)
+        if "mean_similarity_to_primary" in group_frame.columns:
+            group_sims = group_frame.set_index("_group_id_int")["mean_similarity_to_primary"].map(lambda value: safe_float(value, 0.0)).to_dict()
+            frame["_group_mean_sim"] = frame["_group_id_int"].map(group_sims).fillna(0.0).astype(float)
+
+    if "area_pct" in frame.columns:
+        frame["_area_pct"] = pd.to_numeric(frame["area_pct"], errors="coerce").fillna(0.0)
+    else:
+        frame["_area_pct"] = 0.0
+    return frame
+
+
+def filter_reduction_explorer_frame(
+    frame: pd.DataFrame,
+    class_filter: str,
+    action_filter: str,
+    size_filter: str,
+    group_query: str,
+    text_query: str,
+    min_similarity: float,
+    sort_mode: str,
+    seed: int,
+) -> pd.DataFrame:
+    work = frame.copy()
+    if class_filter != "All":
+        work = work[work["_class_label"].astype(str) == str(class_filter)]
+    if action_filter != "All":
+        work = work[work["_action_group"].astype(str) == str(action_filter)]
+    if size_filter != "All":
+        work = work[work["size_bucket"].astype(str) == str(size_filter)]
+    if min_similarity > 0:
+        work = work[(work["_sim"] >= float(min_similarity)) | work["_is_rep"]]
+
+    group_query = str(group_query or "").strip()
+    if group_query:
+        group_mask = work["_group_id_int"].astype(str).str.contains(group_query, regex=False, na=False)
+        file_mask = work["_file_name"].astype(str).str.contains(group_query, case=False, regex=False, na=False)
+        work = work[group_mask | file_mask]
+
+    text_query = str(text_query or "").strip()
+    if text_query:
+        query_lower = text_query.lower()
+        mask = (
+            work["_file_name"].astype(str).str.lower().str.contains(query_lower, regex=False, na=False)
+            | work["image_path"].astype(str).str.lower().str.contains(query_lower, regex=False, na=False)
+            | work["class_name"].astype(str).str.lower().str.contains(query_lower, regex=False, na=False)
+            | work["action"].astype(str).str.lower().str.contains(query_lower, regex=False, na=False)
+            | work["_group_id_int"].astype(str).str.contains(text_query, regex=False, na=False)
+            | work["_record_idx_int"].astype(str).str.contains(text_query, regex=False, na=False)
+        )
+        work = work[mask]
+
+    if work.empty:
+        return work
+    if sort_mode == "Highest similarity":
+        work = work.sort_values(["_sim", "_group_size"], ascending=[False, False])
+    elif sort_mode == "Lowest similarity":
+        work = work.sort_values(["_sim", "_group_size"], ascending=[True, False])
+    elif sort_mode == "Largest group":
+        work = work.sort_values(["_group_size", "_sim"], ascending=[False, False])
+    elif sort_mode == "Drop first":
+        work = work.sort_values(["_is_drop", "_sim"], ascending=[False, False])
+    elif sort_mode == "File name":
+        work = work.sort_values(["_file_name", "_record_idx_int"], ascending=[True, True])
+    elif sort_mode == "Random":
+        work = work.sample(frac=1.0, random_state=int(seed))
+    else:
+        work = work.sort_values(["_group_id_int", "_is_rep", "_sim"], ascending=[True, False, False])
+    return work
+
+
+def render_explorer_metric(label: str, value: Any) -> None:
+    st.markdown(
+        f'<div class="explorer-kpi"><strong>{html.escape(str(value))}</strong><span>{html.escape(str(label))}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def render_reduction_explorer_tile(row, key_prefix: str, selected_record_idx: Optional[int] = None) -> None:
+    record = record_from_csv_row(row)
+    action = str(getattr(row, "action", ""))
+    action_group = reduction_action_group(action)
+    group_id = safe_int(getattr(row, "reduction_group_id", getattr(row, "_group_id_int", -1)), -1)
+    record_idx = safe_int(getattr(row, "record_idx", getattr(row, "_record_idx_int", -1)), -1)
+    sim = safe_float(getattr(row, "similarity_to_primary", getattr(row, "_sim", 0.0)), 0.0)
+    badge_prefix = "DROP" if action.startswith("DROP") else ("REP" if "REPRESENTATIVE" in action else "KEEP")
+    badge = f"{badge_prefix} {sim:.3f}" if sim > 0 else badge_prefix
+    selected_class = " explorer-tile-selected" if selected_record_idx is not None and int(selected_record_idx) == int(record_idx) else ""
+    st.markdown(
+        f"""
+        <div class="explorer-tile{selected_class}">
+          <div class="explorer-tile-meta">
+            <strong>{html.escape(action_group)}</strong><br>
+            G{group_id} | rec={record_idx} | {record.class_id} {html.escape(record.class_name)} | sim={sim:.4f}<br>
+            {html.escape(Path(record.image_path).name)}
+          </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    thumb_ok = render_record_thumb(record, badge=badge)
+    if not thumb_ok:
+        st.caption("crop load failed")
+    if st.button("Inspect", key=f"{key_prefix}_inspect", use_container_width=True):
+        st.session_state["reduction_explorer_selected"] = int(record_idx)
+    if st.button("Data", key=f"{key_prefix}_data", use_container_width=True):
+        open_data_location(record.image_path)
+    render_path_selector(record.image_path, record, key=f"{key_prefix}_select")
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_reduction_record_inspector(
+    frame: pd.DataFrame,
+    selected_record_idx: Optional[int],
+    key_prefix: str,
+) -> None:
+    st.markdown('<div class="explorer-inspector">', unsafe_allow_html=True)
+    if selected_record_idx is None or frame.empty:
+        st.markdown('<div class="explorer-inspector-title">No sample selected</div>', unsafe_allow_html=True)
+        st.caption("Select a crop in the grid or embedding view.")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    matches = frame[frame["_record_idx_int"].astype(int) == int(selected_record_idx)]
+    if matches.empty:
+        st.markdown('<div class="explorer-inspector-title">Selection is outside current filter</div>', unsafe_allow_html=True)
+        st.caption(f"record_idx={selected_record_idx}")
+        st.markdown("</div>", unsafe_allow_html=True)
+        return
+
+    row = matches.iloc[0]
+    record = record_from_csv_row(row)
+    group_id = safe_int(row.get("_group_id_int", row.get("reduction_group_id", -1)), -1)
+    sim = safe_float(row.get("_sim", row.get("similarity_to_primary", 0.0)), 0.0)
+    action = str(row.get("action", ""))
+    title = f"{record.class_id} {record.class_name} | {Path(record.image_path).name}"
+    st.markdown(f'<div class="explorer-inspector-title">{html.escape(title)}</div>', unsafe_allow_html=True)
+    st.markdown(
+        f"""
+        <div class="explorer-inspector-meta">
+          action={html.escape(action)}<br>
+          group=G{group_id} | record_idx={safe_int(row.get("_record_idx_int", -1), -1)} | sim={sim:.4f}<br>
+          size={html.escape(str(row.get("size_bucket", "")))} | area={safe_float(row.get("_area_pct", 0.0)):.2f}%
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    thumb_ok = render_record_thumb(record, badge=f"{sim:.3f} | {record.class_id} {record.class_name}")
+    if not thumb_ok:
+        st.caption("crop load failed")
+    button_col1, button_col2 = st.columns(2)
+    with button_col1:
+        if thumb_ok and st.button("View", key=f"{key_prefix}_view", use_container_width=True):
+            set_preview_image(crop_from_record(record), f"{record.class_id} {record.class_name} | {Path(record.image_path).name}")
+            st.rerun()
+    with button_col2:
+        if st.button("Data", key=f"{key_prefix}_data", use_container_width=True):
+            open_data_location(record.image_path)
+    render_path_selector(record.image_path, record, key=f"{key_prefix}_path")
+
+    meta_rows = [
+        {"field": "image_path", "value": record.image_path},
+        {"field": "label_path", "value": record.label_path},
+        {"field": "bbox_xyxy", "value": json.dumps(list(record.bbox_xyxy), ensure_ascii=False)},
+        {"field": "group_size", "value": safe_int(row.get("_group_size", 0), 0)},
+        {"field": "group_drop_candidates", "value": safe_int(row.get("_group_drop_candidates", 0), 0)},
+        {"field": "group_mean_similarity", "value": f"{safe_float(row.get('_group_mean_sim', 0.0)):.4f}"},
+    ]
+    meta_df = pd.DataFrame(meta_rows)
+    meta_df["value"] = meta_df["value"].astype(str)
+    st.dataframe(meta_df, use_container_width=True, hide_index=True, height=220, key=f"{key_prefix}_meta")
+
+    group_rows = frame[frame["_group_id_int"].astype(int) == int(group_id)].copy()
+    if not group_rows.empty:
+        group_rows = group_rows.sort_values(["_is_rep", "_is_drop", "_sim"], ascending=[False, False, False]).head(8)
+        show_strip = st.checkbox("Show group strip", value=True, key=f"{key_prefix}_show_group_strip")
+        if show_strip:
+            st.caption(f"Group G{group_id} sample strip")
+            strip_cols = st.columns(4)
+            for idx, sample in enumerate(group_rows.itertuples(index=False)):
+                sample_record = record_from_csv_row(sample)
+                sample_record_idx = safe_int(getattr(sample, "record_idx", getattr(sample, "_record_idx_int", idx)), idx)
+                sample_sim = safe_float(getattr(sample, "_sim", getattr(sample, "similarity_to_primary", 0.0)), 0.0)
+                with strip_cols[idx % 4]:
+                    render_record_thumb(sample_record, badge=f"{sample_sim:.3f}")
+                    if st.button("Inspect", key=f"{key_prefix}_strip_{idx}_{sample_record_idx}", use_container_width=True):
+                        st.session_state["reduction_explorer_selected"] = int(sample_record_idx)
+                        st.session_state["reduction_embedding_selected"] = int(sample_record_idx)
+                        st.rerun()
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, members: pd.DataFrame) -> None:
+    del plan_dir
+    st.caption(
+        "FiftyOne-style review: filter the complex dataset on the left, inspect bbox crops in the center, "
+        "and use the right panel as the active sample inspector."
+    )
+    frame = prepare_reduction_explorer_frame(groups, members)
+    if frame.empty:
+        st.info("No reduction member rows are available.")
+        return
+
+    left_col, center_col, inspector_col = st.columns([1.05, 2.75, 1.2])
+    with left_col:
+        st.markdown('<div class="explorer-shell">', unsafe_allow_html=True)
+        st.markdown("**Filters**")
+        class_options = ["All"] + sorted(frame["_class_label"].dropna().astype(str).unique().tolist())
+        action_options = ["All"] + ["Drop candidates", "Representatives", "Protected keeps", "Other keeps"]
+        size_options = ["All"] + sorted(frame["size_bucket"].dropna().astype(str).unique().tolist())
+        class_filter = st.selectbox("Class", class_options, key="reduction_explorer_class")
+        action_filter = st.selectbox("Action", action_options, key="reduction_explorer_action")
+        size_filter = st.selectbox("Size", size_options, key="reduction_explorer_size")
+        group_query = st.text_input("Group / file quick filter", value="", key="reduction_explorer_group_query")
+        text_query = st.text_input("Text search", value="", key="reduction_explorer_text_query")
+        min_similarity = st.slider(
+            "Min similarity",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.0,
+            step=0.001,
+            format="%.3f",
+            key="reduction_explorer_min_similarity",
+        )
+        sort_mode = st.selectbox(
+            "Sort",
+            ["Highest similarity", "Largest group", "Drop first", "Group order", "Lowest similarity", "File name", "Random"],
+            key="reduction_explorer_sort",
+        )
+        page_size = st.selectbox("Page size", [24, 36, 48, 60, 80], index=1, key="reduction_explorer_page_size")
+        seed = st.number_input("Random seed", min_value=0, max_value=999999, value=42, step=1, key="reduction_explorer_seed")
+        if st.button("Clear active sample", key="reduction_explorer_clear_selection", use_container_width=True):
+            st.session_state["reduction_explorer_selected"] = None
+            st.session_state["reduction_embedding_selected"] = None
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    filtered = filter_reduction_explorer_frame(
+        frame,
+        class_filter=class_filter,
+        action_filter=action_filter,
+        size_filter=size_filter,
+        group_query=group_query,
+        text_query=text_query,
+        min_similarity=float(min_similarity),
+        sort_mode=sort_mode,
+        seed=int(seed),
+    )
+
+    with center_col:
+        metric_cols = st.columns(4)
+        with metric_cols[0]:
+            render_explorer_metric("filtered records", f"{len(filtered):,}")
+        with metric_cols[1]:
+            render_explorer_metric("drop candidates", f"{int(filtered['_is_drop'].sum()) if not filtered.empty else 0:,}")
+        with metric_cols[2]:
+            render_explorer_metric("groups", f"{filtered['_group_id_int'].nunique() if not filtered.empty else 0:,}")
+        with metric_cols[3]:
+            mean_sim = float(filtered["_sim"].mean()) if not filtered.empty else 0.0
+            render_explorer_metric("mean similarity", f"{mean_sim:.4f}")
+
+        if filtered.empty:
+            st.warning("No samples match the current filters.")
+        else:
+            total_pages = max(1, int(np.ceil(len(filtered) / int(page_size))))
+            page_col1, page_col2, page_col3 = st.columns([1, 1, 2])
+            with page_col1:
+                page = st.number_input(
+                    "Page",
+                    min_value=1,
+                    max_value=total_pages,
+                    value=1,
+                    step=1,
+                    key="reduction_explorer_page",
+                )
+            with page_col2:
+                st.caption(f"{total_pages:,} pages")
+            with page_col3:
+                current_paths = "\n".join(filtered.head(5000)["image_path"].astype(str).tolist())
+                st.download_button(
+                    "Download Filtered Paths",
+                    current_paths.encode("utf-8-sig"),
+                    "filtered_reduction_paths.txt",
+                    "text/plain",
+                    key="reduction_explorer_filtered_paths",
+                    use_container_width=True,
+                )
+            start = (int(page) - 1) * int(page_size)
+            page_df = filtered.iloc[start : start + int(page_size)]
+            selected_record_idx = st.session_state.get("reduction_explorer_selected")
+            if selected_record_idx is None and not page_df.empty:
+                selected_record_idx = int(page_df.iloc[0]["_record_idx_int"])
+            st.caption(f"showing records {start + 1:,}-{start + len(page_df):,} of {len(filtered):,}")
+            grid_cols = st.columns(4)
+            for pos, row in enumerate(page_df.itertuples(index=False)):
+                record_idx = safe_int(getattr(row, "record_idx", getattr(row, "_record_idx_int", pos)), pos)
+                with grid_cols[pos % 4]:
+                    render_reduction_explorer_tile(
+                        row,
+                        key_prefix=f"reduction_explorer_{start + pos}_{record_idx}",
+                        selected_record_idx=selected_record_idx,
+                    )
+
+    with inspector_col:
+        selected_record_idx = st.session_state.get("reduction_explorer_selected")
+        if selected_record_idx is None and not filtered.empty:
+            selected_record_idx = int(filtered.iloc[0]["_record_idx_int"])
+        render_reduction_record_inspector(filtered if not filtered.empty else frame, selected_record_idx, key_prefix="reduction_dataset_inspector")
+
+    render_selected_paths_panel(key_prefix="reduction_explorer_selected_paths")
+    render_preview_image("reduction_explorer_preview")
+
+
+def build_reduction_embedding_projection(
+    members: pd.DataFrame,
+    feature_index_dir: str,
+    max_points: int,
+    seed: int,
+    dims: int,
+) -> pd.DataFrame:
+    feature_path = Path(feature_index_dir) / "features.npy"
+    if not feature_path.exists():
+        raise FileNotFoundError(f"features.npy not found: {feature_path}")
+    if members.empty:
+        return members.copy()
+
+    work = members.copy()
+    work = work[work["_record_idx_int"].astype(int) >= 0].copy()
+    if work.empty:
+        return work
+    if len(work) > int(max_points):
+        work = work.sample(n=int(max_points), random_state=int(seed)).copy()
+
+    features = np.load(str(feature_path), mmap_mode="r")
+    record_indices = work["_record_idx_int"].astype(int).to_numpy()
+    valid_mask = (record_indices >= 0) & (record_indices < int(features.shape[0]))
+    work = work.iloc[np.flatnonzero(valid_mask)].copy()
+    record_indices = record_indices[valid_mask]
+    if work.empty:
+        return work
+
+    matrix = np.asarray(features[record_indices], dtype=np.float32)
+    matrix = np.nan_to_num(matrix, copy=False)
+    components = max(2, min(int(dims), matrix.shape[0], matrix.shape[1]))
+    from sklearn.decomposition import PCA
+
+    coords = PCA(n_components=components, random_state=int(seed)).fit_transform(matrix)
+    work["x"] = coords[:, 0].astype(float)
+    work["y"] = coords[:, 1].astype(float)
+    work["z"] = coords[:, 2].astype(float) if components >= 3 else 0.0
+    work["_distance_from_center"] = np.linalg.norm(work[["x", "y", "z"]].to_numpy(dtype=np.float32), axis=1)
+    return work
+
+
+def build_reduction_embedding_figure(plot_df: pd.DataFrame, color_by: str, projection: str) -> go.Figure:
+    color_column = {
+        "Class": "class_name",
+        "Action": "_action_group",
+        "Group": "_group_id_int",
+        "Size": "size_bucket",
+    }.get(str(color_by), "class_name")
+    projection = str(projection or "2D").upper()
+    is_3d = projection == "3D"
+    fig = go.Figure()
+
+    plot_df = plot_df.copy()
+    plot_df["_color_value"] = plot_df[color_column].astype(str)
+    values = sorted(plot_df["_color_value"].dropna().unique().tolist())
+    use_group_traces = len(values) <= 30
+    if use_group_traces:
+        for value in values:
+            sub = plot_df[plot_df["_color_value"] == value]
+            customdata = np.stack(
+                [
+                    sub["_record_idx_int"].astype(int).to_numpy(),
+                    sub["_group_id_int"].astype(int).to_numpy(),
+                    sub["action"].astype(str).to_numpy(),
+                    sub["_file_name"].astype(str).to_numpy(),
+                    sub["class_name"].astype(str).to_numpy(),
+                ],
+                axis=1,
+            )
+            common = dict(
+                x=sub["x"].astype(float),
+                y=sub["y"].astype(float),
+                mode="markers",
+                name=str(value),
+                customdata=customdata,
+                text=[
+                    (
+                        f"record={int(record_idx)}<br>"
+                        f"group=G{int(group_id)}<br>"
+                        f"class={html.escape(str(class_id))} {html.escape(str(class_name))}<br>"
+                        f"action={html.escape(str(action))}<br>"
+                        f"sim={float(sim):.4f}<br>"
+                        f"{html.escape(str(file_name))}"
+                    )
+                    for record_idx, group_id, class_id, class_name, action, sim, file_name in zip(
+                        sub["_record_idx_int"].astype(int).tolist(),
+                        sub["_group_id_int"].astype(int).tolist(),
+                        sub["class_id"].tolist(),
+                        sub["class_name"].astype(str).tolist(),
+                        sub["action"].astype(str).tolist(),
+                        sub["_sim"].astype(float).tolist(),
+                        sub["_file_name"].astype(str).tolist(),
+                    )
+                ],
+                hovertemplate="%{text}<extra></extra>",
+                marker=dict(size=7, opacity=0.82),
+            )
+            if is_3d:
+                common["z"] = sub["z"].astype(float)
+                fig.add_trace(go.Scatter3d(**common))
+            else:
+                fig.add_trace(go.Scattergl(**common))
+    else:
+        codes, uniques = pd.factorize(plot_df["_color_value"])
+        customdata = np.stack(
+            [
+                plot_df["_record_idx_int"].astype(int).to_numpy(),
+                plot_df["_group_id_int"].astype(int).to_numpy(),
+                plot_df["action"].astype(str).to_numpy(),
+                plot_df["_file_name"].astype(str).to_numpy(),
+                plot_df["class_name"].astype(str).to_numpy(),
+            ],
+            axis=1,
+        )
+        common = dict(
+            x=plot_df["x"].astype(float),
+            y=plot_df["y"].astype(float),
+            mode="markers",
+            name=str(color_by),
+            customdata=customdata,
+            text=[
+                (
+                    f"record={int(record_idx)}<br>"
+                    f"group=G{int(group_id)}<br>"
+                    f"class={html.escape(str(class_id))} {html.escape(str(class_name))}<br>"
+                    f"action={html.escape(str(action))}<br>"
+                    f"sim={float(sim):.4f}<br>"
+                    f"{html.escape(str(file_name))}"
+                )
+                for record_idx, group_id, class_id, class_name, action, sim, file_name in zip(
+                    plot_df["_record_idx_int"].astype(int).tolist(),
+                    plot_df["_group_id_int"].astype(int).tolist(),
+                    plot_df["class_id"].tolist(),
+                    plot_df["class_name"].astype(str).tolist(),
+                    plot_df["action"].astype(str).tolist(),
+                    plot_df["_sim"].astype(float).tolist(),
+                    plot_df["_file_name"].astype(str).tolist(),
+                )
+            ],
+            hovertemplate="%{text}<extra></extra>",
+            marker=dict(
+                size=7,
+                opacity=0.82,
+                color=codes.astype(float),
+                colorscale="Turbo",
+                showscale=True,
+                colorbar=dict(title=str(color_by)),
+            ),
+        )
+        del uniques
+        if is_3d:
+            common["z"] = plot_df["z"].astype(float)
+            fig.add_trace(go.Scatter3d(**common))
+        else:
+            fig.add_trace(go.Scattergl(**common))
+
+    layout = dict(
+        height=720 if is_3d else 620,
+        margin=dict(l=0, r=0, t=26, b=0),
+        paper_bgcolor="#07111f",
+        plot_bgcolor="#07111f",
+        font=dict(color="#dbeafe"),
+        clickmode="event+select",
+        dragmode="turntable" if is_3d else "pan",
+        legend=dict(bgcolor="rgba(7, 17, 31, 0.78)", font=dict(color="#dbeafe")),
+    )
+    if is_3d:
+        layout["scene"] = dict(
+            bgcolor="#07111f",
+            xaxis=dict(backgroundcolor="#07111f", gridcolor="#1d3a57", zerolinecolor="#2b5c86", color="#dbeafe"),
+            yaxis=dict(backgroundcolor="#07111f", gridcolor="#1d3a57", zerolinecolor="#2b5c86", color="#dbeafe"),
+            zaxis=dict(backgroundcolor="#07111f", gridcolor="#1d3a57", zerolinecolor="#2b5c86", color="#dbeafe"),
+        )
+    else:
+        layout["xaxis"] = dict(title="PCA x", gridcolor="#1d3a57", zerolinecolor="#2b5c86", color="#dbeafe")
+        layout["yaxis"] = dict(title="PCA y", gridcolor="#1d3a57", zerolinecolor="#2b5c86", color="#dbeafe")
+    fig.update_layout(**layout)
+    return fig
+
+
+def render_reduction_embedding_explorer(plan_dir: Path, groups: pd.DataFrame, members: pd.DataFrame, summary: Dict) -> None:
+    st.caption(
+        "Project sampled reduction records from the saved YOLO feature matrix. "
+        "This is useful for checking whether drop groups, protected records, and classes overlap in feature space."
+    )
+    frame = prepare_reduction_explorer_frame(groups, members)
+    if frame.empty:
+        st.info("No reduction member rows are available.")
+        return
+    feature_index_dir = str(summary.get("index_dir") or summary.get("reduction_config", {}).get("index_dir") or "")
+    if not feature_index_dir:
+        st.warning("Reduction summary does not contain index_dir.")
+        return
+    if not Path(feature_index_dir, "features.npy").exists():
+        st.warning(f"features.npy not found: {Path(feature_index_dir, 'features.npy')}")
+        return
+
+    control_col, graph_col, inspector_col = st.columns([1.05, 2.75, 1.2])
+    with control_col:
+        st.markdown('<div class="explorer-shell">', unsafe_allow_html=True)
+        st.markdown("**Embedding Filters**")
+        class_options = ["All"] + sorted(frame["_class_label"].dropna().astype(str).unique().tolist())
+        action_options = ["All"] + ["Drop candidates", "Representatives", "Protected keeps", "Other keeps"]
+        size_options = ["All"] + sorted(frame["size_bucket"].dropna().astype(str).unique().tolist())
+        class_filter = st.selectbox("Class", class_options, key="reduction_embedding_class")
+        action_filter = st.selectbox("Action", action_options, key="reduction_embedding_action")
+        size_filter = st.selectbox("Size", size_options, key="reduction_embedding_size")
+        min_similarity = st.slider(
+            "Min similarity",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.0,
+            step=0.001,
+            format="%.3f",
+            key="reduction_embedding_min_similarity",
+        )
+        projection = st.radio("Projection", ["2D", "3D"], horizontal=True, key="reduction_embedding_projection")
+        color_by = st.selectbox("Color by", ["Class", "Action", "Size", "Group"], key="reduction_embedding_color_by")
+        max_points = st.number_input(
+            "Max points",
+            min_value=500,
+            max_value=20000,
+            value=4000,
+            step=500,
+            key="reduction_embedding_max_points",
+        )
+        seed = st.number_input("Seed", min_value=0, max_value=999999, value=42, step=1, key="reduction_embedding_seed")
+        build_embedding = st.button("Build Embedding Explorer", type="primary", key="btn_build_reduction_embedding", use_container_width=True)
+        st.caption(f"feature index: {feature_index_dir}")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    filtered = filter_reduction_explorer_frame(
+        frame,
+        class_filter=class_filter,
+        action_filter=action_filter,
+        size_filter=size_filter,
+        group_query="",
+        text_query="",
+        min_similarity=float(min_similarity),
+        sort_mode="Group order",
+        seed=int(seed),
+    )
+    request = {
+        "plan_dir": str(plan_dir),
+        "feature_index_dir": feature_index_dir,
+        "class_filter": class_filter,
+        "action_filter": action_filter,
+        "size_filter": size_filter,
+        "min_similarity": float(min_similarity),
+        "projection": projection,
+        "color_by": color_by,
+        "max_points": int(max_points),
+        "seed": int(seed),
+        "candidate_records": int(len(filtered)),
+    }
+
+    if build_embedding:
+        progress = st.progress(0, text="Preparing embedding records...")
+        try:
+            progress.progress(20, text=f"Loading features and sampling {min(len(filtered), int(max_points)):,} records...")
+            start = time.time()
+            projected = build_reduction_embedding_projection(
+                filtered,
+                feature_index_dir=feature_index_dir,
+                max_points=int(max_points),
+                seed=int(seed),
+                dims=3 if projection == "3D" else 2,
+            )
+            progress.progress(86, text="Building graph data...")
+            st.session_state["reduction_embedding_result"] = projected
+            st.session_state["reduction_embedding_request"] = request
+            st.session_state["reduction_embedding_elapsed"] = time.time() - start
+            progress.progress(100, text="Embedding Explorer ready.")
+            time.sleep(0.2)
+            progress.empty()
+        except Exception as exc:
+            progress.empty()
+            st.error(f"Embedding Explorer build failed: {exc}")
+
+    result = st.session_state.get("reduction_embedding_result")
+    result_request = st.session_state.get("reduction_embedding_request") or {}
+    with graph_col:
+        if result is None or not isinstance(result, pd.DataFrame) or result.empty:
+            st.info("Choose filters and click Build Embedding Explorer.")
+        else:
+            elapsed = float(st.session_state.get("reduction_embedding_elapsed", 0.0) or 0.0)
+            stale = any(
+                result_request.get(key) != request.get(key)
+                for key in ["class_filter", "action_filter", "size_filter", "min_similarity", "max_points", "seed", "projection"]
+            )
+            if stale:
+                st.warning("Filters changed after the last build. Click Build Embedding Explorer to refresh the graph.")
+            st.caption(
+                f"points={len(result):,} / candidates={int(result_request.get('candidate_records', len(result))):,} | "
+                f"projection={result_request.get('projection', projection)} | built in {format_duration(elapsed)}"
+            )
+            metric_cols = st.columns(4)
+            with metric_cols[0]:
+                render_explorer_metric("points", f"{len(result):,}")
+            with metric_cols[1]:
+                render_explorer_metric("classes", f"{result['class_name'].nunique():,}")
+            with metric_cols[2]:
+                render_explorer_metric("groups", f"{result['_group_id_int'].nunique():,}")
+            with metric_cols[3]:
+                render_explorer_metric("drops", f"{int(result['_is_drop'].sum()):,}")
+
+            fig = build_reduction_embedding_figure(
+                result,
+                color_by=str(result_request.get("color_by", color_by)),
+                projection=str(result_request.get("projection", projection)),
+            )
+            selected_events = []
+            graph_height = 720 if str(result_request.get("projection", projection)) == "3D" else 620
+            if plotly_events is not None:
+                selected_events = plotly_events(
+                    fig,
+                    click_event=True,
+                    select_event=False,
+                    hover_event=False,
+                    override_height=graph_height,
+                    override_width="100%",
+                    key=f"reduction_embedding_events_{result_request.get('projection', projection)}_{len(result)}_{result_request.get('seed', seed)}",
+                )
+            else:
+                plot_state = st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                    key="reduction_embedding_plot",
+                    on_select="rerun",
+                    selection_mode="points",
+                    theme=None,
+                )
+                selected_events = plotly_state_selected_points(plot_state)
+            if selected_events:
+                custom = event_custom_data_from_plotly_event(selected_events[0], fig)
+                if custom:
+                    selected_record_idx = safe_int(custom[0], -1)
+                    if selected_record_idx >= 0:
+                        st.session_state["reduction_embedding_selected"] = selected_record_idx
+                        st.session_state["reduction_explorer_selected"] = selected_record_idx
+
+    with inspector_col:
+        inspect_frame = result if isinstance(result, pd.DataFrame) and not result.empty else filtered
+        selected_record_idx = st.session_state.get("reduction_embedding_selected") or st.session_state.get("reduction_explorer_selected")
+        if selected_record_idx is None and isinstance(inspect_frame, pd.DataFrame) and not inspect_frame.empty:
+            selected_record_idx = int(inspect_frame.iloc[0]["_record_idx_int"])
+        render_reduction_record_inspector(inspect_frame, selected_record_idx, key_prefix="reduction_embedding_inspector")
+
+    render_selected_paths_panel(key_prefix="reduction_embedding_selected_paths")
+    render_preview_image("reduction_embedding_preview")
+
+
 def render_reduction_visual_review(plan_dir: Path) -> None:
     st.subheader("Visual Review")
     st.caption("Inspect the removed candidates before using the manifest/copy export. Cards show bbox crops, not full images.")
@@ -5208,10 +5998,22 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
 
     summary = load_reduction_summary(str(plan_dir))
 
-    review_tab0, review_tab1, review_tab2, review_tab3, review_tab4 = st.tabs(
-        ["Overview", "Evidence Wall", "Evidence Detail", "Drop Gallery", "Group Compare"]
+    review_modes = [
+        "Overview",
+        "Dataset Explorer",
+        "Embedding Explorer",
+        "Evidence Wall",
+        "Evidence Detail",
+        "Drop Gallery",
+        "Group Compare",
+    ]
+    review_mode = st.radio(
+        "Visual mode",
+        review_modes,
+        horizontal=True,
+        key="reduction_visual_mode",
     )
-    with review_tab0:
+    if review_mode == "Overview":
         st.caption("Use this overview to understand what would disappear before inspecting individual crops.")
         overview_col1, overview_col2, overview_col3 = st.columns(3)
         with overview_col1:
@@ -5345,10 +6147,16 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
             )
             st.plotly_chart(fig, use_container_width=True, key="reduction_overview_group_scatter")
 
-    with review_tab1:
+    if review_mode == "Dataset Explorer":
+        render_reduction_dataset_explorer(plan_dir, groups, members)
+
+    if review_mode == "Embedding Explorer":
+        render_reduction_embedding_explorer(plan_dir, groups, members, summary)
+
+    if review_mode == "Evidence Wall":
         render_reduction_evidence_wall(plan_dir, groups, members)
 
-    with review_tab2:
+    if review_mode == "Evidence Detail":
         if groups.empty:
             st.info("No tight groups available.")
             return
@@ -5448,7 +6256,7 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
                     key=f"reduction_evidence_rows_{selected_group_id}",
                 )
 
-    with review_tab3:
+    if review_mode == "Drop Gallery":
         if drops.empty:
             st.info("No drop candidates in this plan.")
             return
@@ -5500,7 +6308,7 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
                         role="DROP",
                     )
 
-    with review_tab4:
+    if review_mode == "Group Compare":
         if groups.empty:
             st.info("No tight groups available.")
             return
