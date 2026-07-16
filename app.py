@@ -463,7 +463,7 @@ def apply_theme() -> None:
             background: transparent;
             padding: 5px;
             margin-bottom: 8px;
-            min-height: 342px;
+            min-height: 330px;
             overflow: hidden;
         }
         .explorer-tile-selected {
@@ -472,7 +472,7 @@ def apply_theme() -> None:
             box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.55);
         }
         .explorer-tile .thumb-img-frame {
-            max-width: 260px;
+            max-width: 220px;
             margin: 0 auto 6px auto;
             border-color: #24435f;
         }
@@ -495,6 +495,57 @@ def apply_theme() -> None:
             line-height: 1.25;
             margin: 2px 0 8px 0;
             overflow-wrap: anywhere;
+        }
+        .dataset-viewbar {
+            border: 1px solid #1b3855;
+            border-radius: 8px;
+            background: #081827;
+            padding: 9px 11px;
+            margin: 6px 0 12px 0;
+        }
+        .dataset-viewbar-title {
+            color: #f8fafc !important;
+            font-size: 15px;
+            font-weight: 700;
+            line-height: 1.2;
+        }
+        .dataset-viewbar-meta {
+            color: #9cc7e8 !important;
+            font-size: 12px;
+            line-height: 1.35;
+            overflow-wrap: anywhere;
+        }
+        .field-row {
+            border-bottom: 1px solid rgba(29, 58, 87, 0.72);
+            padding: 5px 0 7px 0;
+            margin: 0;
+        }
+        .field-row-name {
+            color: #e5f3ff !important;
+            font-size: 12px;
+            font-weight: 650;
+            line-height: 1.2;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .field-row-meta {
+            color: #9cc7e8 !important;
+            font-size: 11px;
+            line-height: 1.2;
+        }
+        .field-bar {
+            width: 100%;
+            height: 4px;
+            background: #102942;
+            border-radius: 999px;
+            overflow: hidden;
+            margin-top: 4px;
+        }
+        .field-bar-fill {
+            height: 100%;
+            background: #38bdf8;
+            border-radius: 999px;
         }
         .fo-pane-title {
             color: #f8fafc !important;
@@ -5423,6 +5474,113 @@ def render_explorer_metric(label: str, value: Any) -> None:
     )
 
 
+def reduction_explorer_preset_defaults(preset: str) -> Dict[str, Any]:
+    base = {
+        "reduction_explorer_class": "All",
+        "reduction_explorer_action": "All",
+        "reduction_explorer_size": "All",
+        "reduction_explorer_group_query": "",
+        "reduction_explorer_text_query": "",
+        "reduction_explorer_min_similarity": 0.0,
+        "reduction_explorer_sort": "Highest similarity",
+    }
+    if preset == "Drop candidates":
+        base.update({"reduction_explorer_action": "Drop candidates", "reduction_explorer_sort": "Highest similarity"})
+    elif preset == "Representatives":
+        base.update({"reduction_explorer_action": "Representatives", "reduction_explorer_sort": "Group order"})
+    elif preset == "Protected keeps":
+        base.update({"reduction_explorer_action": "Protected keeps", "reduction_explorer_sort": "Highest similarity"})
+    elif preset == "Large groups":
+        base.update({"reduction_explorer_sort": "Largest group"})
+    elif preset == "High similarity":
+        base.update({"reduction_explorer_action": "Drop candidates", "reduction_explorer_min_similarity": 0.995})
+    elif preset == "Random review":
+        base.update({"reduction_explorer_sort": "Random"})
+    return base
+
+
+def apply_reduction_explorer_preset(preset: str) -> None:
+    previous = st.session_state.get("reduction_explorer_last_preset")
+    if previous == preset:
+        return
+    for key, value in reduction_explorer_preset_defaults(preset).items():
+        st.session_state[key] = value
+    st.session_state["reduction_explorer_page"] = 1
+    st.session_state["reduction_explorer_last_preset"] = preset
+
+
+def render_dataset_viewbar(total_records: int, filtered_records: int, grouped_records: int, selected_record_idx: Optional[int]) -> None:
+    selected_text = f"selected rec={selected_record_idx}" if selected_record_idx is not None else "no active sample"
+    st.markdown(
+        f"""
+        <div class="dataset-viewbar">
+          <div class="dataset-viewbar-title">Dataset Explorer</div>
+          <div class="dataset-viewbar-meta">
+            filtered={filtered_records:,} / total={total_records:,} | groups={grouped_records:,} | {html.escape(selected_text)}
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_field_value_rows(
+    title: str,
+    counts: pd.Series,
+    target_key: str,
+    key_prefix: str,
+    max_rows: int = 10,
+) -> None:
+    st.markdown(f'<div class="fo-section-label">{html.escape(title)}</div>', unsafe_allow_html=True)
+    if counts.empty:
+        st.caption("No values")
+        return
+    counts = counts.sort_values(ascending=False).head(int(max_rows))
+    max_count = max(1, int(counts.max()))
+    for idx, (value, count) in enumerate(counts.items()):
+        value_text = str(value)
+        count_int = int(count)
+        pct = count_int / max_count * 100.0
+        if st.button(value_text, key=f"{key_prefix}_{idx}_{slugify(value_text)}", use_container_width=True):
+            st.session_state[target_key] = value_text
+            st.session_state["reduction_explorer_page"] = 1
+            st.rerun()
+        st.markdown(
+            f"""
+            <div class="field-row">
+              <div class="field-row-meta">{count_int:,} records</div>
+              <div class="field-bar"><div class="field-bar-fill" style="width:{pct:.1f}%"></div></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+def render_reduction_field_browser(frame: pd.DataFrame) -> None:
+    st.markdown('<div class="fo-pane-title">Fields</div>', unsafe_allow_html=True)
+    render_field_value_rows(
+        "class",
+        frame["_class_label"].astype(str).value_counts(),
+        "reduction_explorer_class",
+        "reduction_field_class",
+        max_rows=8,
+    )
+    render_field_value_rows(
+        "action",
+        frame["_action_group"].astype(str).value_counts(),
+        "reduction_explorer_action",
+        "reduction_field_action",
+        max_rows=5,
+    )
+    render_field_value_rows(
+        "size",
+        frame["size_bucket"].astype(str).value_counts(),
+        "reduction_explorer_size",
+        "reduction_field_size",
+        max_rows=6,
+    )
+
+
 def render_reduction_explorer_tile(row, key_prefix: str, selected_record_idx: Optional[int] = None) -> None:
     record = record_from_csv_row(row)
     action = str(getattr(row, "action", ""))
@@ -5550,10 +5708,37 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
         st.info("No reduction member rows are available.")
         return
 
-    left_col, center_col, inspector_col = st.columns([1.05, 2.75, 1.2])
+    preset_col, grid_col, page_size_col, reset_col = st.columns([1.5, 1, 1, 1])
+    with preset_col:
+        preset = st.selectbox(
+            "View",
+            ["All samples", "Drop candidates", "Representatives", "Protected keeps", "Large groups", "High similarity", "Random review"],
+            key="reduction_explorer_view_preset",
+        )
+        apply_reduction_explorer_preset(str(preset))
+    with grid_col:
+        grid_density = st.selectbox("Grid", ["Comfortable", "Compact", "Large"], key="reduction_explorer_grid_density")
+    with page_size_col:
+        page_size = st.selectbox("Page size", [24, 36, 48, 60, 80], index=1, key="reduction_explorer_page_size")
+    with reset_col:
+        st.caption("Reset")
+        if st.button("All filters", key="reduction_explorer_reset_filters", use_container_width=True):
+            for key, value in reduction_explorer_preset_defaults("All samples").items():
+                st.session_state[key] = value
+            st.session_state["reduction_explorer_page"] = 1
+            st.session_state["reduction_explorer_last_preset"] = "All samples"
+            st.session_state["reduction_explorer_selected"] = None
+            st.session_state["reduction_embedding_selected"] = None
+            st.rerun()
+
+    grid_column_count = {"Compact": 5, "Comfortable": 4, "Large": 3}.get(str(grid_density), 4)
+
+    left_col, center_col, inspector_col = st.columns([0.95, 3.15, 1.2])
     with left_col:
         st.markdown('<div class="explorer-shell">', unsafe_allow_html=True)
-        st.markdown("**Filters**")
+        render_reduction_field_browser(frame)
+        st.divider()
+        st.markdown('<div class="fo-pane-title">Filters</div>', unsafe_allow_html=True)
         class_options = ["All"] + sorted(frame["_class_label"].dropna().astype(str).unique().tolist())
         action_options = ["All"] + ["Drop candidates", "Representatives", "Protected keeps", "Other keeps"]
         size_options = ["All"] + sorted(frame["size_bucket"].dropna().astype(str).unique().tolist())
@@ -5576,7 +5761,6 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
             ["Highest similarity", "Largest group", "Drop first", "Group order", "Lowest similarity", "File name", "Random"],
             key="reduction_explorer_sort",
         )
-        page_size = st.selectbox("Page size", [24, 36, 48, 60, 80], index=1, key="reduction_explorer_page_size")
         seed = st.number_input("Random seed", min_value=0, max_value=999999, value=42, step=1, key="reduction_explorer_seed")
         if st.button("Clear active sample", key="reduction_explorer_clear_selection", use_container_width=True):
             st.session_state["reduction_explorer_selected"] = None
@@ -5616,6 +5800,13 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
             st.session_state["reduction_explorer_selected"] = int(filtered.iloc[0]["_record_idx_int"])
 
     with center_col:
+        selected_record_idx_for_bar = st.session_state.get("reduction_explorer_selected")
+        render_dataset_viewbar(
+            total_records=len(frame),
+            filtered_records=len(filtered),
+            grouped_records=filtered["_group_id_int"].nunique() if not filtered.empty else 0,
+            selected_record_idx=selected_record_idx_for_bar,
+        )
         metric_cols = st.columns(4)
         with metric_cols[0]:
             render_explorer_metric("filtered records", f"{len(filtered):,}")
@@ -5666,10 +5857,10 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
                 selected_record_idx = int(page_df.iloc[0]["_record_idx_int"])
                 st.session_state["reduction_explorer_selected"] = int(selected_record_idx)
             st.caption(f"showing records {start + 1:,}-{start + len(page_df):,} of {len(filtered):,}")
-            grid_cols = st.columns(4)
+            grid_cols = st.columns(int(grid_column_count))
             for pos, row in enumerate(page_df.itertuples(index=False)):
                 record_idx = safe_int(getattr(row, "record_idx", getattr(row, "_record_idx_int", pos)), pos)
-                with grid_cols[pos % 4]:
+                with grid_cols[pos % int(grid_column_count)]:
                     render_reduction_explorer_tile(
                         row,
                         key_prefix=f"reduction_explorer_{start + pos}_{record_idx}",
