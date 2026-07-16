@@ -4725,6 +4725,191 @@ def build_reduction_evidence_sheet(group_members: pd.DataFrame, max_candidates: 
     return canvas
 
 
+def reduction_group_sort_frame(groups: pd.DataFrame) -> pd.DataFrame:
+    frame = groups.copy()
+    frame["_group_id_int"] = frame["reduction_group_id"].map(lambda value: safe_int(value, 0))
+    frame["_drop_candidates"] = frame.get("drop_candidates", 0).map(lambda value: safe_int(value, 0))
+    frame["_group_size"] = frame.get("group_size", 0).map(lambda value: safe_int(value, 0))
+    frame["_mean_sim"] = frame.get("mean_similarity_to_primary", 0.0).map(lambda value: safe_float(value, 0.0))
+    frame["_class_key"] = frame.get("class_name", "").astype(str)
+    return frame
+
+
+def select_reduction_board_groups(
+    groups: pd.DataFrame,
+    class_filter: str,
+    sort_mode: str,
+    max_groups: int,
+) -> pd.DataFrame:
+    if groups.empty:
+        return groups.copy()
+    frame = reduction_group_sort_frame(groups)
+    if class_filter != "All":
+        frame = frame[
+            (frame.get("class_name", "").astype(str) == str(class_filter))
+            | (frame.get("class_id", "").astype(str) == str(class_filter))
+        ].copy()
+    if frame.empty:
+        return frame
+
+    if sort_mode == "One Top Group Per Class":
+        frame = frame.sort_values(["_drop_candidates", "_mean_sim"], ascending=[False, False])
+        frame = frame.groupby("_class_key", group_keys=False).head(1)
+        frame = frame.sort_values(["_drop_candidates", "_mean_sim"], ascending=[False, False])
+    elif sort_mode == "Highest Similarity":
+        frame = frame.sort_values(["_mean_sim", "_drop_candidates"], ascending=[False, False])
+    elif sort_mode == "Largest Group":
+        frame = frame.sort_values(["_group_size", "_mean_sim"], ascending=[False, False])
+    else:
+        frame = frame.sort_values(["_drop_candidates", "_mean_sim"], ascending=[False, False])
+    return frame.head(int(max_groups)).copy()
+
+
+def group_member_subset_for_board(members: pd.DataFrame, group_id: int) -> pd.DataFrame:
+    if members.empty:
+        return members.copy()
+    if "_group_id_int" in members.columns:
+        return members[members["_group_id_int"] == int(group_id)].copy()
+    return members[members["reduction_group_id"].map(lambda value: safe_int(value, -1)) == int(group_id)].copy()
+
+
+def sorted_group_samples(group_members: pd.DataFrame, samples_per_group: int) -> tuple:
+    if group_members.empty:
+        return None, pd.DataFrame()
+    if "is_representative" in group_members.columns:
+        rep_mask = boolish_series(group_members["is_representative"])
+    else:
+        rep_mask = pd.Series([False] * len(group_members), index=group_members.index)
+    reps = group_members[rep_mask].copy()
+    if reps.empty:
+        reps = group_members.head(1).copy()
+    primary = reps.iloc[0]
+
+    others = group_members.drop(index=reps.index, errors="ignore").copy()
+    if others.empty:
+        return primary, others
+    others["_drop_rank"] = others.get("action", "").astype(str).str.startswith("DROP").astype(int)
+    others["_sim"] = others.get("similarity_to_primary", 0.0).map(lambda value: safe_float(value, 0.0))
+    others = others.sort_values(["_drop_rank", "_sim"], ascending=[False, False]).head(int(samples_per_group))
+    return primary, others
+
+
+def build_reduction_sample_board(
+    groups: pd.DataFrame,
+    members: pd.DataFrame,
+    max_groups: int = 8,
+    samples_per_group: int = 4,
+) -> Optional[Image.Image]:
+    if groups.empty or members.empty:
+        return None
+
+    selected_groups = reduction_group_sort_frame(groups).head(int(max_groups))
+    members_work = members.copy()
+    members_work["_group_id_int"] = members_work["reduction_group_id"].map(lambda value: safe_int(value, -1))
+
+    width = 1520
+    thumb = 118
+    header_h = 126
+    row_h = 184
+    footer_h = 42
+    left_w = 285
+    rep_x = 330
+    cand_start_x = 545
+    cand_gap = 145
+    rows = []
+    for _, group in selected_groups.iterrows():
+        group_id = safe_int(group.get("reduction_group_id", 0))
+        subset = group_member_subset_for_board(members_work, group_id)
+        primary, others = sorted_group_samples(subset, samples_per_group)
+        if primary is not None:
+            rows.append((group, primary, others))
+    if not rows:
+        return None
+
+    height = header_h + len(rows) * row_h + footer_h
+    canvas = Image.new("RGB", (width, height), (7, 17, 31))
+    draw = ImageDraw.Draw(canvas)
+    title_font = sheet_font(27, bold=True)
+    body_font = sheet_font(16)
+    label_font = sheet_font(14, bold=True)
+    small_font = sheet_font(13)
+    tiny_font = sheet_font(12)
+
+    draw.text((30, 22), "At-a-glance reduction sample board", fill=(248, 250, 252), font=title_font)
+    draw.text(
+        (30, 62),
+        "Each row shows one tight feature group: kept representative on the left, visually redundant candidates connected by similarity lines.",
+        fill=(156, 199, 232),
+        font=body_font,
+    )
+    legend_x = 1060
+    legends = [("REP kept", (52, 211, 153)), ("DROP candidate", (248, 113, 113)), ("PROTECTED keep", (251, 191, 36))]
+    for idx, (text, color) in enumerate(legends):
+        x = legend_x + idx * 145
+        draw.rounded_rectangle((x, 30, x + 22, 52), radius=5, fill=color)
+        draw.text((x + 30, 33), text, fill=(226, 232, 240), font=tiny_font)
+    draw.line((26, header_h - 12, width - 26, header_h - 12), fill=(29, 58, 87), width=2)
+
+    for row_idx, (group, primary, others) in enumerate(rows):
+        y0 = header_h + row_idx * row_h
+        y_mid = y0 + 28
+        band_color = (8, 24, 40) if row_idx % 2 == 0 else (6, 20, 34)
+        draw.rounded_rectangle((22, y0 + 8, width - 22, y0 + row_h - 12), radius=12, fill=band_color, outline=(24, 54, 83))
+
+        group_id = safe_int(group.get("reduction_group_id", 0))
+        class_id = safe_int(group.get("class_id", 0))
+        class_name = str(group.get("class_name", ""))
+        group_size = safe_int(group.get("group_size", 0))
+        drop_count = safe_int(group.get("drop_candidates", 0))
+        mean_sim = safe_float(group.get("mean_similarity_to_primary", 0.0))
+        size_buckets = str(group.get("size_buckets", ""))
+        rep_file = Path(str(getattr(primary, "image_path", getattr(primary, "file_name", "")))).name
+
+        draw.text((42, y0 + 25), f"G{group_id}", fill=(248, 250, 252), font=label_font)
+        draw.text((42, y0 + 50), f"{class_id} {class_name}", fill=(226, 232, 240), font=body_font)
+        draw.text((42, y0 + 76), f"n={group_size:,}  drop={drop_count:,}", fill=(248, 113, 113), font=body_font)
+        draw.text((42, y0 + 101), f"mean sim={mean_sim:.4f}", fill=(125, 211, 252), font=body_font)
+        draw_sheet_label(draw, (42, y0 + 126), f"size={size_buckets}", small_font, (148, 163, 184), 28)
+        draw_sheet_label(draw, (42, y0 + 148), rep_file, tiny_font, (148, 163, 184), 34)
+
+        rep_y = y_mid
+        rep_crop = load_record_crop_for_sheet(primary, thumb)
+        canvas.paste(rep_crop, (rep_x, rep_y))
+        draw.rounded_rectangle((rep_x - 3, rep_y - 3, rep_x + thumb + 3, rep_y + thumb + 3), radius=9, outline=(52, 211, 153), width=4)
+        draw.rounded_rectangle((rep_x + 7, rep_y + 7, rep_x + 60, rep_y + 29), radius=7, fill=(6, 20, 34), outline=(52, 211, 153))
+        draw.text((rep_x + 15, rep_y + 11), "REP", fill=(248, 250, 252), font=tiny_font)
+
+        rep_center = (rep_x + thumb + 3, rep_y + thumb // 2)
+        for cand_idx, (_, sample) in enumerate(others.iterrows()):
+            x = cand_start_x + cand_idx * cand_gap
+            y = rep_y
+            action = str(sample.get("action", ""))
+            color = reduction_action_color(action)
+            sim = safe_float(sample.get("similarity_to_primary", 0.0), 0.0)
+            sample_crop = load_record_crop_for_sheet(sample, thumb)
+            end = (x - 4, y + thumb // 2)
+            draw.line((rep_center[0], rep_center[1], end[0], end[1]), fill=color, width=3)
+            label_x = int((rep_center[0] + end[0]) / 2) - 20
+            label_y = int((rep_center[1] + end[1]) / 2) - 12
+            draw.rounded_rectangle((label_x - 6, label_y - 3, label_x + 62, label_y + 20), radius=7, fill=(6, 20, 34), outline=color)
+            draw.text((label_x, label_y), f"{sim:.3f}", fill=(248, 250, 252), font=tiny_font)
+            canvas.paste(sample_crop, (x, y))
+            draw.rounded_rectangle((x - 3, y - 3, x + thumb + 3, y + thumb + 3), radius=9, outline=color, width=4)
+            tag = "DROP" if action.startswith("DROP") else "KEEP"
+            draw.rounded_rectangle((x + 7, y + 7, x + 68, y + 29), radius=7, fill=(6, 20, 34), outline=color)
+            draw.text((x + 14, y + 11), tag, fill=(248, 250, 252), font=tiny_font)
+            sample_file = Path(str(sample.get("image_path", sample.get("file_name", "")))).name
+            draw_sheet_label(draw, (x, y + thumb + 12), sample_file, tiny_font, (156, 199, 232), 20)
+
+    draw.text(
+        (30, height - 29),
+        "Use this board as a first-pass visual check, then open Evidence Map / Group Compare for detailed review before export.",
+        fill=(148, 163, 184),
+        font=small_font,
+    )
+    return canvas
+
+
 def render_reduction_flow_chart(summary: Dict) -> None:
     planned = int(summary.get("planned_records", 0) or 0)
     reps = int(summary.get("representative_records", 0) or 0)
@@ -4772,6 +4957,11 @@ def image_to_png_bytes(image: Image.Image) -> bytes:
     return buffer.getvalue()
 
 
+def reduction_sample_board_path(plan_dir: Path, class_filter: str, sort_mode: str, rows: int, samples: int) -> Path:
+    key = f"{slugify(str(class_filter))}_{slugify(str(sort_mode))}_{int(rows)}x{int(samples)}"
+    return plan_dir / f"reduction_sample_board_{key}.png"
+
+
 def render_reduction_visual_review(plan_dir: Path) -> None:
     st.subheader("Visual Review")
     st.caption("Inspect the removed candidates before using the manifest/copy export. Cards show bbox crops, not full images.")
@@ -4808,6 +4998,123 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
                 st.metric("Largest group", "0")
 
         render_reduction_flow_chart(summary)
+
+        if not groups.empty and not members.empty:
+            st.subheader("At-a-glance Sample Board")
+            st.caption(
+                "Start here: this board shows what the reducible data actually looks like before you inspect tables. "
+                "One row is one tight group, with the representative and sampled drop/protected candidates side by side."
+            )
+            board_classes = ["All"] + sorted(groups["class_name"].dropna().astype(str).unique().tolist())
+            board_c1, board_c2, board_c3, board_c4 = st.columns(4)
+            with board_c1:
+                board_class = st.selectbox("Board class", board_classes, key="reduction_board_class")
+            with board_c2:
+                board_sort = st.selectbox(
+                    "Board mode",
+                    ["One Top Group Per Class", "Largest Drop Groups", "Largest Group", "Highest Similarity"],
+                    index=0,
+                    key="reduction_board_sort",
+                )
+            with board_c3:
+                board_groups_count = st.number_input(
+                    "Board rows",
+                    min_value=2,
+                    max_value=12,
+                    value=8,
+                    step=1,
+                    key="reduction_board_groups_count",
+                )
+            with board_c4:
+                board_samples = st.number_input(
+                    "Samples / row",
+                    min_value=2,
+                    max_value=7,
+                    value=4,
+                    step=1,
+                    key="reduction_board_samples",
+                )
+            board_groups = select_reduction_board_groups(
+                groups,
+                class_filter=str(board_class),
+                sort_mode=str(board_sort),
+                max_groups=int(board_groups_count),
+            )
+            if board_groups.empty:
+                st.warning("No groups match the sample board filters.")
+            else:
+                board_path = reduction_sample_board_path(
+                    plan_dir,
+                    class_filter=str(board_class),
+                    sort_mode=str(board_sort),
+                    rows=int(board_groups_count),
+                    samples=int(board_samples),
+                )
+                board_action_col1, board_action_col2 = st.columns([1, 3])
+                with board_action_col1:
+                    build_board = st.button(
+                        "Generate Sample Board",
+                        key="btn_generate_reduction_sample_board",
+                        use_container_width=True,
+                    )
+                with board_action_col2:
+                    st.caption(f"Cached board: {board_path}")
+                if build_board:
+                    with st.spinner("Loading crop samples and writing board PNG..."):
+                        board = build_reduction_sample_board(
+                            board_groups,
+                            members,
+                            max_groups=int(board_groups_count),
+                            samples_per_group=int(board_samples),
+                        )
+                    if board is None:
+                        st.warning("Could not build the sample board.")
+                    else:
+                        board_path.parent.mkdir(parents=True, exist_ok=True)
+                        board.save(board_path)
+                        st.success(f"Sample board generated: {board_path}")
+                if board_path.exists():
+                    try:
+                        with Image.open(board_path) as board_file:
+                            board_image = board_file.convert("RGB").copy()
+                        render_full_width_image(board_image, caption=f"Reduction sample board | {board_sort} | class={board_class}")
+                        st.download_button(
+                            "Download sample board PNG",
+                            board_path.read_bytes(),
+                            file_name=board_path.name,
+                            mime="image/png",
+                            key=f"reduction_sample_board_png_{slugify(str(board_class))}_{slugify(str(board_sort))}_{int(board_groups_count)}_{int(board_samples)}",
+                            use_container_width=True,
+                        )
+                    except Exception as exc:
+                        st.warning(f"Cached sample board load failed: {exc}")
+                else:
+                    st.info("Generate the sample board once. It will be cached in the reduction plan folder and shown instantly next time.")
+
+            class_summary = members.copy()
+            class_summary["_is_drop"] = class_summary["action"].astype(str).str.startswith("DROP")
+            class_summary["_is_protected"] = class_summary["action"].astype(str).str.contains("PROTECTED", regex=False)
+            class_summary["_is_rep"] = class_summary["action"].astype(str).str.contains("REPRESENTATIVE", regex=False)
+            class_view = (
+                class_summary.groupby(["class_id", "class_name"], as_index=False)
+                .agg(
+                    grouped_records=("record_idx", "count"),
+                    representatives=("_is_rep", "sum"),
+                    protected=("_is_protected", "sum"),
+                    drop_candidates=("_is_drop", "sum"),
+                )
+                .sort_values("drop_candidates", ascending=False)
+            )
+            class_view["drop_pct_in_grouped"] = (
+                class_view["drop_candidates"] / class_view["grouped_records"].clip(lower=1) * 100.0
+            ).round(2)
+            st.dataframe(
+                class_view,
+                use_container_width=True,
+                hide_index=True,
+                height=260,
+                key="reduction_overview_class_summary",
+            )
 
         chart_col1, chart_col2 = st.columns(2)
         if not members.empty:
