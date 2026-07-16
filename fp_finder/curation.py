@@ -962,6 +962,27 @@ def export_reduced_dataset(
     return summary
 
 
+def _load_reduction_keep_override_indices(plan_root: Path) -> set[int]:
+    path = plan_root / "reduction_keep_overrides.json"
+    if not path.exists():
+        return set()
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception:
+        return set()
+    values = data.get("record_indices", data.get("record_idx", []))
+    if not isinstance(values, list):
+        return set()
+    indices = set()
+    for value in values:
+        try:
+            indices.add(int(float(value)))
+        except Exception:
+            continue
+    return indices
+
+
 def export_similarity_reduction_plan(
     plan_dir: str,
     output_dir: str,
@@ -987,6 +1008,31 @@ def export_similarity_reduction_plan(
         with summary_path.open("r", encoding="utf-8") as f:
             plan_summary = json.load(f) or {}
     partial_plan = bool(plan_summary.get("partial_plan", False))
+    override_indices = _load_reduction_keep_override_indices(plan_root)
+
+    keep_records_export = pd.read_csv(keep_records_path) if keep_records_path.exists() else pd.DataFrame()
+    drop_records_export = pd.read_csv(drop_records_path) if drop_records_path.exists() else pd.DataFrame()
+    user_override_records = pd.DataFrame()
+    if override_indices and not drop_records_export.empty and "record_idx" in drop_records_export.columns:
+        drop_record_indices = drop_records_export["record_idx"].map(lambda value: int(float(value)))
+        override_mask = drop_record_indices.isin(override_indices)
+        user_override_records = drop_records_export[override_mask].copy()
+        drop_records_export = drop_records_export[~override_mask].copy()
+        if not user_override_records.empty:
+            user_override_records["original_action"] = user_override_records.get("action", "")
+            user_override_records["action"] = "KEEP_USER_OVERRIDE"
+            user_override_records["is_user_keep_override"] = True
+            keep_records_export = pd.concat([keep_records_export, user_override_records], ignore_index=True)
+            override_image_paths = set(user_override_records["image_path"].astype(str).tolist())
+            if override_image_paths and "image_path" in image_plan.columns:
+                image_override_mask = image_plan["image_path"].astype(str).isin(override_image_paths)
+                image_plan.loc[image_override_mask, "image_action"] = "KEEP_IMAGE_USER_OVERRIDE"
+                if "drop_safety" in image_plan.columns:
+                    image_plan.loc[image_override_mask, "drop_safety"] = "USER_OVERRIDE_KEEP"
+                if "actions" in image_plan.columns:
+                    image_plan.loc[image_override_mask, "actions"] = (
+                        image_plan.loc[image_override_mask, "actions"].astype(str) + ", KEEP_USER_OVERRIDE"
+                    )
 
     drop_mask = image_plan["image_action"].astype(str).str.startswith("DROP")
     if "drop_safety" in image_plan.columns:
@@ -1000,9 +1046,9 @@ def export_similarity_reduction_plan(
     (output / "keep_labels.txt").write_text("\n".join(keep_labels) + ("\n" if keep_labels else ""), encoding="utf-8")
     drop_df.to_csv(output / "drop_image_candidates.csv", index=False, encoding="utf-8-sig")
     if keep_records_path.exists():
-        shutil.copy2(keep_records_path, output / "kept_records.csv")
+        keep_records_export.to_csv(output / "kept_records.csv", index=False, encoding="utf-8-sig")
     if drop_records_path.exists():
-        shutil.copy2(drop_records_path, output / "dropped_records.csv")
+        drop_records_export.to_csv(output / "dropped_records.csv", index=False, encoding="utf-8-sig")
 
     copied_images = 0
     copied_labels = 0
@@ -1038,8 +1084,8 @@ def export_similarity_reduction_plan(
                     shutil.copy2(image_path, target)
                 copied_images += 1
 
-        if effective_label_policy == "filtered" and keep_records_path.exists():
-            keep_records = pd.read_csv(keep_records_path)
+        if effective_label_policy == "filtered" and not keep_records_export.empty:
+            keep_records = keep_records_export.copy()
             keep_records = keep_records[keep_records["image_path"].astype(str).isin(set(keep_df["image_path"].astype(str).tolist()))].copy()
             kept_record_count = int(len(keep_records))
             label_plan_rows = []
@@ -1119,7 +1165,9 @@ def export_similarity_reduction_plan(
         "copied_labels": int(copied_labels),
         "kept_record_annotations": int(kept_record_count),
         "filtered_label_lines": int(filtered_label_lines),
-        "drop_record_candidates": int(plan_summary.get("drop_record_candidates", 0) or 0),
+        "drop_record_candidates": int(len(drop_records_export)) if drop_records_path.exists() else int(plan_summary.get("drop_record_candidates", 0) or 0),
+        "original_drop_record_candidates": int(plan_summary.get("drop_record_candidates", 0) or 0),
+        "user_keep_overrides": int(len(user_override_records)),
         "record_reduction_pct_of_planned": float(plan_summary.get("record_reduction_pct_of_planned", 0.0) or 0.0),
         "partial_plan": bool(partial_plan),
     }

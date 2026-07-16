@@ -353,6 +353,7 @@ def apply_theme() -> None:
             padding: 8px;
             margin-bottom: 10px;
             overflow: hidden;
+            box-sizing: border-box;
         }
         .thumb-title {
             color: #e5f3ff !important;
@@ -383,12 +384,46 @@ def apply_theme() -> None:
             justify-content: center;
             overflow: hidden;
             position: relative;
+            box-sizing: border-box;
+            flex: 0 0 auto;
         }
         .thumb-img-frame img {
             width: 100%;
             height: 100%;
             object-fit: contain;
+            object-position: center center;
             display: block;
+        }
+        .thumb-img-frame.result-thumb,
+        .thumb-img-frame.calibration-thumb,
+        .thumb-img-frame.cluster-panel-thumb {
+            max-width: 220px;
+            margin-top: 0;
+        }
+        .thumb-img-frame.query-thumb,
+        .thumb-img-frame.video-thumb {
+            max-width: 230px;
+            margin-top: 0;
+        }
+        .thumb-img-frame.video-selected-thumb {
+            max-width: 260px;
+            margin-top: 0;
+        }
+        .thumb-img-frame.explorer-thumb {
+            max-width: none;
+            margin: 0 auto 7px auto;
+        }
+        .thumb-img-frame.inspector-thumb {
+            max-width: 260px;
+            margin-top: 0;
+        }
+        .thumb-img-frame.strip-thumb {
+            max-width: 150px;
+            margin-top: 0;
+        }
+        .thumb-img-frame.cluster-sample-image {
+            max-width: 210px;
+            margin-top: 0;
         }
         .thumb-badge {
             position: absolute;
@@ -413,6 +448,18 @@ def apply_theme() -> None:
         .thumb-card-compact .thumb-img-frame {
             max-width: 260px;
             margin-top: 0;
+        }
+        .result-tile,
+        .reduction-tile {
+            border: 1px solid #1d3a57;
+            border-radius: 7px;
+            background: #0a1b2d;
+            padding: 8px;
+            margin-bottom: 10px;
+            min-height: 410px;
+            height: 410px;
+            overflow: hidden;
+            box-sizing: border-box;
         }
         .reduction-tile-meta {
             min-height: 42px;
@@ -458,13 +505,15 @@ def apply_theme() -> None:
             font-size: 11px;
         }
         .explorer-tile {
-            border: 1px solid transparent;
+            border: 1px solid #1d3a57;
             border-radius: 7px;
-            background: transparent;
-            padding: 5px;
+            background: #0a1b2d;
+            padding: 8px;
             margin-bottom: 8px;
-            min-height: 330px;
+            min-height: 430px;
+            height: 430px;
             overflow: hidden;
+            box-sizing: border-box;
         }
         .explorer-tile-selected {
             border-color: #38bdf8;
@@ -472,12 +521,12 @@ def apply_theme() -> None:
             box-shadow: 0 0 0 1px rgba(56, 189, 248, 0.55);
         }
         .explorer-tile .thumb-img-frame {
-            max-width: 220px;
+            max-width: none;
             margin: 0 auto 6px auto;
             border-color: #24435f;
         }
         .explorer-tile-meta {
-            min-height: 50px;
+            height: 56px;
             color: #9cc7e8 !important;
             font-size: 11px;
             line-height: 1.22;
@@ -1330,9 +1379,11 @@ def show_results(
     for idx, item in enumerate(results):
         record = item["record"]
         with grid[idx % columns]:
+            st.markdown('<div class="result-tile">', unsafe_allow_html=True)
             thumb_ok = render_record_thumb(
                 record,
                 badge=f"{item['score']:.3f} | {record.class_id} {record.class_name}",
+                wrapper_class="result-thumb",
             )
             if not thumb_ok:
                 st.caption(f"#{item['rank']} crop load failed")
@@ -1368,6 +1419,7 @@ def show_results(
             ):
                 request_db_neighbor_search(record, max(5, min(100, len(results))))
                 st.rerun()
+            st.markdown("</div>", unsafe_allow_html=True)
 
     render_selected_paths_panel(key_prefix=f"{key_prefix}_selected_paths")
 
@@ -1884,7 +1936,7 @@ def render_cluster_record_panel(
     if meta:
         st.caption(meta)
     if show_image:
-        thumb_ok = render_record_thumb(record, badge=f"{record.class_id} {record.class_name}")
+        thumb_ok = render_record_thumb(record, badge=f"{record.class_id} {record.class_name}", wrapper_class="cluster-panel-thumb")
         if not thumb_ok:
             st.caption(f"record {record.record_id} image load failed")
     else:
@@ -2825,7 +2877,7 @@ def crop_search_tab(project: Dict, config: Dict) -> None:
                 f'<div class="query-preview-meta">{html.escape(Path(uploaded.name).name)}</div>',
                 unsafe_allow_html=True,
             )
-            render_thumb_image(image, uploaded.name, cache_key=f"query:{uploaded.name}:{image.size}")
+            render_thumb_image(image, uploaded.name, cache_key=f"query:{uploaded.name}:{image.size}", wrapper_class="query-thumb")
             run_yolo = st.button(
                 "Search by YOLO Feature",
                 type="primary",
@@ -4470,6 +4522,7 @@ def video_detection_tab(project: Dict, config: Dict) -> None:
                         det.crop,
                         f"{det.class_name} {det.det_id}",
                         cache_key=f"video:{det.det_id}:{det.frame_index}:{det.bbox_xyxy}",
+                        wrapper_class="video-thumb",
                     )
                     if st.button(
                         "View",
@@ -4499,6 +4552,7 @@ def video_detection_tab(project: Dict, config: Dict) -> None:
                 selected_for_search.crop,
                 "Selected false-positive candidate",
                 cache_key=f"video:selected:{selected_for_search.det_id}:{selected_for_search.frame_index}:{selected_for_search.bbox_xyxy}",
+                wrapper_class="video-selected-thumb",
             )
             video_path = st.session_state.get("last_video_path")
             if not video_path:
@@ -4655,7 +4709,11 @@ def render_calibration_examples(feature_index_dir: str, detail: pd.DataFrame, ke
             q_col, n_col = st.columns(2)
             with q_col:
                 st.caption(f"Query | {query_record.class_id} {query_record.class_name}")
-                if render_record_thumb(query_record, badge=f"Q {query_record.class_id} {query_record.class_name}"):
+                if render_record_thumb(
+                    query_record,
+                    badge=f"Q {query_record.class_id} {query_record.class_name}",
+                    wrapper_class="calibration-thumb",
+                ):
                     if st.button("View Q", key=f"{card_key}_view_q", use_container_width=True):
                         set_preview_image(
                             crop_from_record(query_record),
@@ -4668,7 +4726,11 @@ def render_calibration_examples(feature_index_dir: str, detail: pd.DataFrame, ke
                 render_path_selector(query_record.image_path, query_record, key=f"{card_key}_select_q")
             with n_col:
                 st.caption(f"Top1 | {neighbor_record.class_id} {neighbor_record.class_name}")
-                if render_record_thumb(neighbor_record, badge=f"N {neighbor_record.class_id} {neighbor_record.class_name}"):
+                if render_record_thumb(
+                    neighbor_record,
+                    badge=f"N {neighbor_record.class_id} {neighbor_record.class_name}",
+                    wrapper_class="calibration-thumb",
+                ):
                     if st.button("View N", key=f"{card_key}_view_n", use_container_width=True):
                         set_preview_image(
                             crop_from_record(neighbor_record),
@@ -4913,6 +4975,77 @@ def load_reduction_summary(plan_dir: str) -> Dict:
         return json.load(f) or {}
 
 
+def reduction_keep_overrides_path(plan_dir: Path) -> Path:
+    return Path(plan_dir) / "reduction_keep_overrides.json"
+
+
+def load_reduction_keep_override_indices(plan_dir: Path) -> set:
+    path = reduction_keep_overrides_path(Path(plan_dir))
+    if not path.exists():
+        return set()
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception:
+        return set()
+    values = data.get("record_indices", [])
+    if not isinstance(values, list):
+        return set()
+    indices = set()
+    for value in values:
+        try:
+            indices.add(int(float(value)))
+        except Exception:
+            continue
+    return indices
+
+
+def save_reduction_keep_override_indices(plan_dir: Path, record_indices: set) -> None:
+    path = reduction_keep_overrides_path(Path(plan_dir))
+    payload = {
+        "record_indices": sorted(int(value) for value in record_indices),
+        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def set_reduction_keep_override(plan_dir: Path, record_idx: int, enabled: bool) -> None:
+    indices = load_reduction_keep_override_indices(Path(plan_dir))
+    record_idx = int(record_idx)
+    if bool(enabled):
+        indices.add(record_idx)
+    else:
+        indices.discard(record_idx)
+    save_reduction_keep_override_indices(Path(plan_dir), indices)
+
+
+def annotate_reduction_keep_overrides(frame: pd.DataFrame, override_indices: set) -> pd.DataFrame:
+    if frame.empty:
+        return frame.copy()
+    work = frame.copy()
+    if "record_idx" not in work.columns:
+        work["record_idx"] = work.get("record_id", pd.Series(range(len(work)), index=work.index))
+    record_indices = work["record_idx"].map(lambda value: safe_int(value, -1))
+    original_action = work["action"].astype(str) if "action" in work.columns else pd.Series([""] * len(work), index=work.index)
+    work["original_action"] = original_action
+    override_mask = record_indices.isin(set(int(value) for value in override_indices)) & original_action.str.startswith("DROP")
+    work["user_keep_override"] = override_mask
+    if "action" not in work.columns:
+        work["action"] = ""
+    work.loc[override_mask, "action"] = "KEEP_USER_OVERRIDE"
+    return work
+
+
+def effective_drop_mask(frame: pd.DataFrame) -> pd.Series:
+    if frame.empty:
+        return pd.Series([], dtype=bool)
+    if "action" not in frame.columns:
+        return pd.Series([False] * len(frame), index=frame.index)
+    return frame["action"].astype(str).str.startswith("DROP")
+
+
 def render_report_csv_preview(report_dir: Path, filename: str, title: str, key_prefix: str, max_rows: int = 300) -> None:
     path = report_dir / filename
     st.subheader(title)
@@ -4940,13 +5073,15 @@ def render_report_csv_preview(report_dir: Path, filename: str, title: str, key_p
         pass
 
 
-def render_reduction_record_tile(row, key_prefix: str, badge: str, role: str = "") -> None:
+def render_reduction_record_tile(row, key_prefix: str, badge: str, role: str = "", plan_dir: Optional[Path] = None) -> None:
     record = record_from_csv_row(row)
     action = str(getattr(row, "action", role or ""))
+    original_action = str(getattr(row, "original_action", action))
+    is_user_keep = bool(getattr(row, "user_keep_override", False))
     group_id = getattr(row, "reduction_group_id", "")
     sim = getattr(row, "similarity_to_primary", None)
     sim_text = f" | sim {safe_float(sim):.4f}" if sim is not None and pd.notna(sim) else ""
-    role_text = role or ("DROP" if action.startswith("DROP") else ("REP" if "REPRESENTATIVE" in action else "KEEP"))
+    role_text = "USER KEEP" if is_user_keep else (role or ("DROP" if action.startswith("DROP") else ("REP" if "REPRESENTATIVE" in action else "KEEP")))
     file_name = Path(record.image_path).name
     meta_line = f"G{group_id} | {record.class_id} {record.class_name}{sim_text}"
 
@@ -4956,7 +5091,7 @@ def render_reduction_record_tile(row, key_prefix: str, badge: str, role: str = "
         """,
         unsafe_allow_html=True,
     )
-    thumb_ok = render_record_thumb(record, badge=badge)
+    thumb_ok = render_record_thumb(record, badge=badge, wrapper_class="reduction-thumb")
     if not thumb_ok:
         st.caption("crop load failed")
     st.markdown(
@@ -4976,6 +5111,12 @@ def render_reduction_record_tile(row, key_prefix: str, badge: str, role: str = "
         st.rerun()
     if st.button("Data", key=f"{key_prefix}_data", use_container_width=True):
         open_data_location(record.image_path)
+    if original_action.startswith("DROP") and plan_dir is not None:
+        keep_checked = st.checkbox("Keep", value=bool(is_user_keep), key=f"{key_prefix}_keep_override")
+        if bool(keep_checked) != bool(is_user_keep):
+            record_idx = safe_int(getattr(row, "record_idx", record.record_id), record.record_id)
+            set_reduction_keep_override(Path(plan_dir), int(record_idx), bool(keep_checked))
+            st.rerun()
     render_path_selector(record.image_path, record, key=f"{key_prefix}_select")
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -5006,6 +5147,8 @@ def safe_int(value: Any, default: int = 0) -> int:
 
 def reduction_action_color(action: str) -> tuple:
     action_text = str(action or "").upper()
+    if "USER_OVERRIDE" in action_text:
+        return (34, 197, 94)
     if action_text.startswith("DROP"):
         return (248, 113, 113)
     if "PROTECT" in action_text:
@@ -5662,6 +5805,8 @@ def render_reduction_decision_board(plan_dir: Path, groups: pd.DataFrame, member
 
 def reduction_action_group(action: Any) -> str:
     action_text = str(action or "").upper()
+    if "USER_OVERRIDE" in action_text:
+        return "User keeps"
     if action_text.startswith("DROP"):
         return "Drop candidates"
     if "REPRESENTATIVE" in action_text:
@@ -5689,11 +5834,14 @@ def prepare_reduction_explorer_frame(groups: pd.DataFrame, members: pd.DataFrame
         frame["is_representative"] = frame["action"].astype(str).str.contains("REPRESENTATIVE", regex=False)
     if "is_protected" not in frame.columns:
         frame["is_protected"] = frame["action"].astype(str).str.contains("PROTECTED", regex=False)
+    if "user_keep_override" not in frame.columns:
+        frame["user_keep_override"] = False
 
     frame["_record_idx_int"] = frame["record_idx"].map(lambda value: safe_int(value, -1)).astype(int)
     frame["_group_id_int"] = frame.get("reduction_group_id", -1).map(lambda value: safe_int(value, -1)).astype(int)
     frame["_sim"] = pd.to_numeric(frame["similarity_to_primary"], errors="coerce").fillna(0.0).astype(float)
-    frame["_is_drop"] = frame["action"].astype(str).str.startswith("DROP")
+    frame["_is_user_keep_override"] = boolish_series(frame["user_keep_override"])
+    frame["_is_drop"] = frame["action"].astype(str).str.startswith("DROP") & ~frame["_is_user_keep_override"]
     frame["_is_rep"] = boolish_series(frame["is_representative"])
     frame["_is_protected"] = boolish_series(frame["is_protected"])
     frame["_action_group"] = frame["action"].map(reduction_action_group)
@@ -5805,6 +5953,8 @@ def reduction_explorer_preset_defaults(preset: str) -> Dict[str, Any]:
         base.update({"reduction_explorer_action": "Representatives", "reduction_explorer_sort": "Group order"})
     elif preset == "Protected keeps":
         base.update({"reduction_explorer_action": "Protected keeps", "reduction_explorer_sort": "Highest similarity"})
+    elif preset == "User keeps":
+        base.update({"reduction_explorer_action": "User keeps", "reduction_explorer_sort": "Highest similarity"})
     elif preset == "Large groups":
         base.update({"reduction_explorer_sort": "Largest group"})
     elif preset == "High similarity":
@@ -5896,14 +6046,21 @@ def render_reduction_field_browser(frame: pd.DataFrame) -> None:
     )
 
 
-def render_reduction_explorer_tile(row, key_prefix: str, selected_record_idx: Optional[int] = None) -> None:
+def render_reduction_explorer_tile(
+    row,
+    key_prefix: str,
+    selected_record_idx: Optional[int] = None,
+    plan_dir: Optional[Path] = None,
+) -> None:
     record = record_from_csv_row(row)
     action = str(getattr(row, "action", ""))
     action_group = reduction_action_group(action)
     group_id = safe_int(getattr(row, "reduction_group_id", getattr(row, "_group_id_int", -1)), -1)
     record_idx = safe_int(getattr(row, "record_idx", getattr(row, "_record_idx_int", -1)), -1)
     sim = safe_float(getattr(row, "similarity_to_primary", getattr(row, "_sim", 0.0)), 0.0)
-    badge_prefix = "DROP" if action.startswith("DROP") else ("REP" if "REPRESENTATIVE" in action else "KEEP")
+    original_action = str(getattr(row, "original_action", action))
+    is_user_keep = bool(getattr(row, "user_keep_override", getattr(row, "_is_user_keep_override", False)))
+    badge_prefix = "USER KEEP" if is_user_keep else ("DROP" if action.startswith("DROP") else ("REP" if "REPRESENTATIVE" in action else "KEEP"))
     badge = f"{badge_prefix} {sim:.3f}" if sim > 0 else badge_prefix
     selected_class = " explorer-tile-selected" if selected_record_idx is not None and int(selected_record_idx) == int(record_idx) else ""
     st.markdown(
@@ -5912,7 +6069,7 @@ def render_reduction_explorer_tile(row, key_prefix: str, selected_record_idx: Op
         """,
         unsafe_allow_html=True,
     )
-    thumb_ok = render_record_thumb(record, badge=badge)
+    thumb_ok = render_record_thumb(record, badge=badge, wrapper_class="explorer-thumb")
     if not thumb_ok:
         st.caption("crop load failed")
     st.markdown(
@@ -5927,6 +6084,11 @@ def render_reduction_explorer_tile(row, key_prefix: str, selected_record_idx: Op
     )
     if st.button("Open", key=f"{key_prefix}_open", use_container_width=True):
         st.session_state["reduction_explorer_selected"] = int(record_idx)
+    if original_action.startswith("DROP") and plan_dir is not None:
+        keep_checked = st.checkbox("Keep", value=bool(is_user_keep), key=f"{key_prefix}_keep_override")
+        if bool(keep_checked) != bool(is_user_keep):
+            set_reduction_keep_override(Path(plan_dir), int(record_idx), bool(keep_checked))
+            st.rerun()
     render_path_selector(record.image_path, record, key=f"{key_prefix}_select")
     st.markdown("</div>", unsafe_allow_html=True)
 
@@ -5967,7 +6129,7 @@ def render_reduction_record_inspector(
         """,
         unsafe_allow_html=True,
     )
-    thumb_ok = render_record_thumb(record, badge=f"{sim:.3f} | {record.class_id} {record.class_name}")
+    thumb_ok = render_record_thumb(record, badge=f"{sim:.3f} | {record.class_id} {record.class_name}", wrapper_class="inspector-thumb")
     if not thumb_ok:
         st.caption("crop load failed")
     button_col1, button_col2 = st.columns(2)
@@ -6004,7 +6166,7 @@ def render_reduction_record_inspector(
                 sample_record_idx = safe_int(getattr(sample, "record_idx", getattr(sample, "_record_idx_int", idx)), idx)
                 sample_sim = safe_float(getattr(sample, "_sim", getattr(sample, "similarity_to_primary", 0.0)), 0.0)
                 with strip_cols[idx % 4]:
-                    render_record_thumb(sample_record, badge=f"{sample_sim:.3f}")
+                    render_record_thumb(sample_record, badge=f"{sample_sim:.3f}", wrapper_class="strip-thumb")
                     if st.button("Inspect", key=f"{key_prefix}_strip_{idx}_{sample_record_idx}", use_container_width=True):
                         st.session_state["reduction_explorer_selected"] = int(sample_record_idx)
                         st.session_state["reduction_embedding_selected"] = int(sample_record_idx)
@@ -6013,7 +6175,6 @@ def render_reduction_record_inspector(
 
 
 def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, members: pd.DataFrame) -> None:
-    del plan_dir
     st.caption(
         "Dataset review: filter records on the left, inspect bbox crops in the center, "
         "and use the right panel as the active sample inspector."
@@ -6027,7 +6188,7 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
     with preset_col:
         preset = st.selectbox(
             "View",
-            ["All samples", "Drop candidates", "Representatives", "Protected keeps", "Large groups", "High similarity", "Random review"],
+            ["All samples", "Drop candidates", "User keeps", "Representatives", "Protected keeps", "Large groups", "High similarity", "Random review"],
             key="reduction_explorer_view_preset",
         )
         apply_reduction_explorer_preset(str(preset))
@@ -6055,7 +6216,7 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
         st.divider()
         st.markdown('<div class="fo-pane-title">Filters</div>', unsafe_allow_html=True)
         class_options = ["All"] + sorted(frame["_class_label"].dropna().astype(str).unique().tolist())
-        action_options = ["All"] + ["Drop candidates", "Representatives", "Protected keeps", "Other keeps"]
+        action_options = ["All"] + ["Drop candidates", "User keeps", "Representatives", "Protected keeps", "Other keeps"]
         size_options = ["All"] + sorted(frame["size_bucket"].dropna().astype(str).unique().tolist())
         class_filter = st.selectbox("Class", class_options, key="reduction_explorer_class")
         action_filter = st.selectbox("Action", action_options, key="reduction_explorer_action")
@@ -6122,14 +6283,16 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
             grouped_records=filtered["_group_id_int"].nunique() if not filtered.empty else 0,
             selected_record_idx=selected_record_idx_for_bar,
         )
-        metric_cols = st.columns(4)
+        metric_cols = st.columns(5)
         with metric_cols[0]:
             render_explorer_metric("filtered records", f"{len(filtered):,}")
         with metric_cols[1]:
             render_explorer_metric("drop candidates", f"{int(filtered['_is_drop'].sum()) if not filtered.empty else 0:,}")
         with metric_cols[2]:
-            render_explorer_metric("groups", f"{filtered['_group_id_int'].nunique() if not filtered.empty else 0:,}")
+            render_explorer_metric("user keeps", f"{int(filtered['_is_user_keep_override'].sum()) if not filtered.empty else 0:,}")
         with metric_cols[3]:
+            render_explorer_metric("groups", f"{filtered['_group_id_int'].nunique() if not filtered.empty else 0:,}")
+        with metric_cols[4]:
             mean_sim = float(filtered["_sim"].mean()) if not filtered.empty else 0.0
             render_explorer_metric("mean similarity", f"{mean_sim:.4f}")
 
@@ -6180,6 +6343,7 @@ def render_reduction_dataset_explorer(plan_dir: Path, groups: pd.DataFrame, memb
                         row,
                         key_prefix=f"reduction_explorer_{start + pos}_{record_idx}",
                         selected_record_idx=selected_record_idx,
+                        plan_dir=plan_dir,
                     )
 
     with inspector_col:
@@ -6394,7 +6558,7 @@ def render_reduction_embedding_explorer(plan_dir: Path, groups: pd.DataFrame, me
         st.markdown('<div class="explorer-shell">', unsafe_allow_html=True)
         st.markdown("**Embedding Filters**")
         class_options = ["All"] + sorted(frame["_class_label"].dropna().astype(str).unique().tolist())
-        action_options = ["All"] + ["Drop candidates", "Representatives", "Protected keeps", "Other keeps"]
+        action_options = ["All"] + ["Drop candidates", "User keeps", "Representatives", "Protected keeps", "Other keeps"]
         size_options = ["All"] + sorted(frame["size_bucket"].dropna().astype(str).unique().tolist())
         class_filter = st.selectbox("Class", class_options, key="reduction_embedding_class")
         action_filter = st.selectbox("Action", action_options, key="reduction_embedding_action")
@@ -6564,6 +6728,10 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
         return
 
     summary = load_reduction_summary(str(plan_dir))
+    override_indices = load_reduction_keep_override_indices(plan_dir)
+    members = annotate_reduction_keep_overrides(members, override_indices)
+    drops = annotate_reduction_keep_overrides(drops, override_indices)
+    valid_override_count = int(boolish_series(members.get("user_keep_override", pd.Series([], dtype=bool))).sum()) if not members.empty else 0
 
     review_modes = [
         "Overview",
@@ -6580,11 +6748,14 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
         horizontal=True,
         key="reduction_visual_mode",
     )
+    if valid_override_count:
+        st.success(f"User keep overrides active: {valid_override_count:,} records will be kept during export.")
     if review_mode == "Overview":
         st.caption("Use this overview to understand what would disappear before inspecting individual crops.")
         overview_col1, overview_col2, overview_col3 = st.columns(3)
         with overview_col1:
-            st.metric("Drop records", f"{len(drops):,}")
+            effective_drops = int(effective_drop_mask(drops).sum()) if not drops.empty else 0
+            st.metric("Drop records", f"{effective_drops:,}", delta=f"-{valid_override_count:,} user keeps" if valid_override_count else None)
         with overview_col2:
             st.metric("Tight groups", f"{len(groups):,}")
         with overview_col3:
@@ -6828,27 +6999,42 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
         if drops.empty:
             st.info("No drop candidates in this plan.")
             return
-        f1, f2, f3, f4 = st.columns(4)
+        f1, f2, f3, f4, f5, f6 = st.columns(6)
         with f1:
             classes = ["All"] + sorted(drops["class_name"].dropna().astype(str).unique().tolist())
             selected_class = st.selectbox("Drop class", classes, key="reduction_visual_drop_class")
         with f2:
-            actions = ["All"] + sorted(drops["action"].dropna().astype(str).unique().tolist())
-            selected_action = st.selectbox("Drop action", actions, key="reduction_visual_drop_action")
+            review_status = st.selectbox("Review", ["All", "Still dropped", "User keeps"], key="reduction_visual_drop_review")
         with f3:
+            min_drop_similarity = st.slider(
+                "Min sim",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.0,
+                step=0.001,
+                format="%.3f",
+                key="reduction_visual_drop_min_sim",
+            )
+        with f4:
             sort_mode = st.selectbox(
                 "Drop sort",
                 ["Highest similarity", "Lowest similarity", "Largest group", "Random"],
                 key="reduction_visual_drop_sort",
             )
-        with f4:
+        with f5:
             max_cards = st.number_input("Cards", min_value=4, max_value=80, value=24, step=4, key="reduction_visual_drop_cards")
+        with f6:
+            st.metric("User keeps", f"{valid_override_count:,}")
 
         gallery = drops.copy()
         if selected_class != "All":
             gallery = gallery[gallery["class_name"].astype(str) == str(selected_class)]
-        if selected_action != "All":
-            gallery = gallery[gallery["action"].astype(str) == str(selected_action)]
+        if review_status == "Still dropped":
+            gallery = gallery[effective_drop_mask(gallery)]
+        elif review_status == "User keeps":
+            gallery = gallery[boolish_series(gallery.get("user_keep_override", pd.Series([False] * len(gallery), index=gallery.index)))]
+        if min_drop_similarity > 0 and "similarity_to_primary" in gallery.columns:
+            gallery = gallery[gallery["similarity_to_primary"].map(lambda value: safe_float(value, 0.0)) >= float(min_drop_similarity)]
         if gallery.empty:
             st.warning("No drop candidates match the current filters.")
         else:
@@ -6868,12 +7054,15 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
             for pos, row in enumerate(gallery.itertuples(index=False)):
                 with cols[pos % 4]:
                     sim = getattr(row, "similarity_to_primary", None)
-                    badge = f"DROP {float(sim):.3f}" if sim is not None and pd.notna(sim) else "DROP"
+                    action = str(getattr(row, "action", ""))
+                    badge_prefix = "USER KEEP" if "USER_OVERRIDE" in action else "DROP"
+                    badge = f"{badge_prefix} {float(sim):.3f}" if sim is not None and pd.notna(sim) else badge_prefix
                     render_reduction_record_tile(
                         row,
                         key_prefix=f"reduction_drop_gallery_{pos}_{getattr(row, 'record_idx', pos)}",
                         badge=badge,
                         role="DROP",
+                        plan_dir=plan_dir,
                     )
 
     if review_mode == "Group Compare":
@@ -6917,28 +7106,45 @@ def render_reduction_visual_review(plan_dir: Path) -> None:
                     key_prefix=f"reduction_group_rep_{selected_group_id}_{pos}_{getattr(row, 'record_idx', pos)}",
                     badge="KEEP REP",
                     role="REPRESENTATIVE",
+                    plan_dir=plan_dir,
                 )
         with compare_cols[1]:
             st.markdown("**Drop / Protected Candidates**")
-            max_members = st.number_input(
-                "Group member cards",
-                min_value=4,
-                max_value=80,
-                value=24,
-                step=4,
-                key="reduction_visual_group_cards",
-            )
+            group_ctrl1, group_ctrl2 = st.columns(2)
+            with group_ctrl1:
+                max_members = st.number_input(
+                    "Group member cards",
+                    min_value=4,
+                    max_value=80,
+                    value=24,
+                    step=4,
+                    key="reduction_visual_group_cards",
+                )
+            with group_ctrl2:
+                group_min_sim = st.slider(
+                    "Group min sim",
+                    min_value=0.0,
+                    max_value=1.0,
+                    value=0.0,
+                    step=0.001,
+                    format="%.3f",
+                    key="reduction_visual_group_min_sim",
+                )
+            if group_min_sim > 0 and "similarity_to_primary" in others.columns:
+                others = others[others["similarity_to_primary"].map(lambda value: safe_float(value, 0.0)) >= float(group_min_sim)].copy()
             member_cols = st.columns(4)
             for pos, row in enumerate(others.head(int(max_members)).itertuples(index=False)):
                 with member_cols[pos % 4]:
                     action = str(getattr(row, "action", ""))
                     sim = getattr(row, "similarity_to_primary", None)
-                    badge = f"{'DROP' if action.startswith('DROP') else 'KEEP'} {float(sim):.3f}" if sim is not None and pd.notna(sim) else action
+                    badge_role = "USER KEEP" if "USER_OVERRIDE" in action else ("DROP" if action.startswith("DROP") else "KEEP")
+                    badge = f"{badge_role} {float(sim):.3f}" if sim is not None and pd.notna(sim) else action
                     render_reduction_record_tile(
                         row,
                         key_prefix=f"reduction_group_member_{selected_group_id}_{pos}_{getattr(row, 'record_idx', pos)}",
                         badge=badge,
                         role="DROP" if action.startswith("DROP") else "PROTECTED",
+                        plan_dir=plan_dir,
                     )
 
 
@@ -7090,13 +7296,25 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
         return
 
     summary = load_reduction_summary(str(selected_plan_path))
+    override_indices = load_reduction_keep_override_indices(selected_plan_path)
+    valid_override_count = 0
+    drop_records_path_for_overrides = selected_plan_path / "reduction_drop_records.csv"
+    if override_indices and drop_records_path_for_overrides.exists():
+        try:
+            drop_idx_preview = pd.read_csv(drop_records_path_for_overrides, usecols=["record_idx"])
+            valid_override_count = int(
+                drop_idx_preview["record_idx"].map(lambda value: safe_int(value, -1)).isin(override_indices).sum()
+            )
+        except Exception:
+            valid_override_count = len(override_indices)
+    effective_drop_records = max(0, int(summary.get("drop_record_candidates", 0)) - int(valid_override_count))
     metric1, metric2, metric3, metric4, metric5 = st.columns(5)
     with metric1:
         st.metric("Planned records", f"{int(summary.get('planned_records', 0)):,}")
     with metric2:
         st.metric("Tight groups", f"{int(summary.get('tight_groups', 0)):,}")
     with metric3:
-        st.metric("Drop records", f"{int(summary.get('drop_record_candidates', 0)):,}")
+        st.metric("Drop records", f"{effective_drop_records:,}", delta=f"-{valid_override_count:,} user keeps" if valid_override_count else None)
     with metric4:
         st.metric("Natural reduction", f"{float(summary.get('record_reduction_pct_of_planned', 0.0)):.2f}%")
     with metric5:
@@ -7131,7 +7349,19 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
         image_plan_path = selected_plan_path / "reduction_image_plan.csv"
         if image_plan_path.exists():
             try:
-                image_plan_preview = pd.read_csv(image_plan_path, usecols=["image_action"])
+                image_plan_preview = pd.read_csv(image_plan_path)
+                if override_indices and drop_records_path_for_overrides.exists() and "image_path" in image_plan_preview.columns:
+                    override_drop_rows = pd.read_csv(drop_records_path_for_overrides, usecols=["record_idx", "image_path"])
+                    override_image_paths = set(
+                        override_drop_rows[
+                            override_drop_rows["record_idx"].map(lambda value: safe_int(value, -1)).isin(override_indices)
+                        ]["image_path"].astype(str).tolist()
+                    )
+                    if override_image_paths:
+                        image_plan_preview.loc[
+                            image_plan_preview["image_path"].astype(str).isin(override_image_paths),
+                            "image_action",
+                        ] = "KEEP_IMAGE_USER_OVERRIDE"
                 image_action_counts = image_plan_preview["image_action"].astype(str).value_counts().to_dict()
                 drop_images_preview = sum(
                     int(count) for action, count in image_action_counts.items() if str(action).startswith("DROP")
@@ -7143,7 +7373,7 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
                 with x2:
                     st.metric("Image drop candidates", f"{drop_images_preview:,}")
                 with x3:
-                    st.metric("Record drop candidates", f"{int(summary.get('drop_record_candidates', 0)):,}")
+                    st.metric("Record drop candidates", f"{effective_drop_records:,}", delta=f"-{valid_override_count:,} user keeps" if valid_override_count else None)
                 with x4:
                     st.metric("Record reduction", f"{float(summary.get('record_reduction_pct_of_planned', 0.0)):.2f}%")
             except Exception as exc:
@@ -7188,6 +7418,7 @@ def similarity_reduction_planner_section(project: Dict, feature_index_dir: str) 
                     f"Export complete: kept_images={result['kept_images']:,}, "
                     f"drop_images={result['drop_image_candidates']:,}, "
                     f"drop_records={result['drop_record_candidates']:,}, "
+                    f"user_keeps={result.get('user_keep_overrides', 0):,}, "
                     f"labels={result['effective_label_policy']}, output={result['output_dir']}"
                 )
             except Exception as exc:
