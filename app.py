@@ -501,6 +501,7 @@ def init_state() -> None:
         "last_video_path": None,
         "yolo_feature_index": None,
         "yolo_feature_index_dir": None,
+        "yolo_feature_index_device": None,
         "yolo_detector": None,
         "yolo_detector_key": None,
         "active_project_name": None,
@@ -532,14 +533,8 @@ def init_state() -> None:
 
 def sidebar_config() -> Dict:
     st.sidebar.header("Runtime")
-    default_device_index = 0
-    try:
-        import torch
-
-        default_device_index = 1 if torch.cuda.is_available() else 0
-    except Exception:
-        default_device_index = 0
-    device = st.sidebar.selectbox("Device", ["cpu", "cuda"], index=default_device_index, key="cfg_device")
+    device = st.sidebar.selectbox("Device", ["cpu", "cuda"], index=0, key="cfg_device")
+    st.sidebar.caption("CPU is the default for stable feature search. Use CUDA only when the local PyTorch/CUDA/cuDNN stack is verified.")
 
     return {
         "device": device,
@@ -2532,6 +2527,21 @@ def default_yolo_feature_index_dir(weights_path: str) -> str:
     return f"artifacts/yolo_feature_index_{stem}"
 
 
+def load_yolo_feature_index_with_fallback(feature_index_dir: str, device: str) -> tuple[YoloFeatureIndex, str, Optional[str]]:
+    requested_device = str(device or "cpu")
+    try:
+        index = YoloFeatureIndex.load(feature_index_dir, device=requested_device)
+        return index, requested_device, None
+    except Exception as exc:
+        if requested_device != "cpu":
+            try:
+                index = YoloFeatureIndex.load(feature_index_dir, device="cpu")
+                return index, "cpu", str(exc)
+            except Exception:
+                raise exc
+        raise
+
+
 def maybe_auto_load_yolo_feature_index(feature_index_dir: str, device: str) -> None:
     current_dir = st.session_state.get("yolo_feature_index_dir")
     if st.session_state.get("yolo_feature_index") is not None and current_dir == feature_index_dir:
@@ -2539,6 +2549,7 @@ def maybe_auto_load_yolo_feature_index(feature_index_dir: str, device: str) -> N
     if st.session_state.get("yolo_feature_index") is not None and current_dir != feature_index_dir:
         st.session_state["yolo_feature_index"] = None
         st.session_state["yolo_feature_index_dir"] = None
+        st.session_state["yolo_feature_index_device"] = None
 
     root = Path(feature_index_dir)
     if not (root / "index.faiss").exists() or not (root / "config.json").exists() or not index_records_ready(root):
@@ -2546,12 +2557,17 @@ def maybe_auto_load_yolo_feature_index(feature_index_dir: str, device: str) -> N
 
     try:
         with st.spinner("Loading YOLO feature index..."):
-            st.session_state["yolo_feature_index"] = YoloFeatureIndex.load(
+            loaded_index, loaded_device, fallback_reason = load_yolo_feature_index_with_fallback(
                 feature_index_dir,
                 device=device,
             )
+            st.session_state["yolo_feature_index"] = loaded_index
             st.session_state["yolo_feature_index_dir"] = feature_index_dir
-        st.success("YOLO feature index auto-loaded")
+            st.session_state["yolo_feature_index_device"] = loaded_device
+        if fallback_reason:
+            st.warning(f"YOLO feature index auto-loaded on CPU after CUDA failed: {fallback_reason}")
+        else:
+            st.success(f"YOLO feature index auto-loaded on {loaded_device}")
     except Exception as exc:
         st.warning(f"YOLO feature index auto-load failed: {exc}")
 
@@ -2572,16 +2588,27 @@ def ensure_yolo_feature_index_loaded(feature_index_dir: Optional[str] = None, de
     status = st.empty()
     try:
         with st.spinner(f"Loading YOLO feature index: {target_dir}"):
-            st.session_state["yolo_feature_index"] = YoloFeatureIndex.load(
+            loaded_index, loaded_device, fallback_reason = load_yolo_feature_index_with_fallback(
                 target_dir,
                 device=target_device,
             )
+            st.session_state["yolo_feature_index"] = loaded_index
             st.session_state["yolo_feature_index_dir"] = target_dir
-        status.success(f"YOLO feature index loaded in {format_duration(time.time() - start)}")
+            st.session_state["yolo_feature_index_device"] = loaded_device
+        if fallback_reason:
+            status.warning(
+                f"YOLO feature index loaded on CPU in {format_duration(time.time() - start)} "
+                f"after CUDA failed: {fallback_reason}"
+            )
+        else:
+            status.success(
+                f"YOLO feature index loaded on {loaded_device} in {format_duration(time.time() - start)}"
+            )
         return True
     except Exception as exc:
         st.session_state["yolo_feature_index"] = None
         st.session_state["yolo_feature_index_dir"] = None
+        st.session_state["yolo_feature_index_device"] = None
         status.error(f"YOLO feature index load failed: {exc}")
         return False
 
@@ -2597,8 +2624,10 @@ def show_yolo_feature_index_status(weights_path: str) -> None:
     index_weight = config.get("weights_path", "")
     model_name = Path(weights_path).name if weights_path else ""
     index_model_name = Path(index_weight).name if index_weight else ""
+    loaded_device = st.session_state.get("yolo_feature_index_device", "-")
     st.caption(
-        f"Loaded YOLO feature index: {loaded_dir} | records={len(index.records):,} | dim={config.get('dim', '-')}"
+        f"Loaded YOLO feature index: {loaded_dir} | device={loaded_device} | "
+        f"records={len(index.records):,} | dim={config.get('dim', '-')}"
     )
     if model_name and index_model_name and model_name != index_model_name:
         st.warning(
@@ -3849,13 +3878,21 @@ def video_detection_tab(project: Dict, config: Dict) -> None:
                 st.caption("Feature index loads when you press Load YOLO Feature Index or start a search.")
             if st.button("Load YOLO Feature Index", key="btn_load_yolo_feature_index"):
                 try:
-                    st.session_state["yolo_feature_index"] = YoloFeatureIndex.load(
+                    loaded_index, loaded_device, fallback_reason = load_yolo_feature_index_with_fallback(
                         feature_index_dir,
                         device=config["device"],
                     )
+                    st.session_state["yolo_feature_index"] = loaded_index
                     st.session_state["yolo_feature_index_dir"] = feature_index_dir
-                    st.success("YOLO feature index loaded")
+                    st.session_state["yolo_feature_index_device"] = loaded_device
+                    if fallback_reason:
+                        st.warning(f"YOLO feature index loaded on CPU after CUDA failed: {fallback_reason}")
+                    else:
+                        st.success(f"YOLO feature index loaded on {loaded_device}")
                 except Exception as exc:
+                    st.session_state["yolo_feature_index"] = None
+                    st.session_state["yolo_feature_index_dir"] = None
+                    st.session_state["yolo_feature_index_device"] = None
                     st.error(f"YOLO feature index load failed: {exc}")
             loaded_feature_dir = st.session_state.get("yolo_feature_index_dir")
             if loaded_feature_dir:
